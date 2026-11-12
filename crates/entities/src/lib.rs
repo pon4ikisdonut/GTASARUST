@@ -131,13 +131,40 @@ impl PlayerEntity {
             self.velocity.z -= 18.0 * dt;
         }
 
+        // Slide smoothly along nearly vertical walls from `.col` geometry
+        let horiz = Vec3::new(self.velocity.x, self.velocity.y, 0.0);
+        let horiz_speed = horiz.length();
+        if horiz_speed > 1e-4 {
+            let dir = horiz / horiz_speed;
+            let wall_origin = self.position + Vec3::new(0.0, 0.0, 0.9);
+            let wall_dist = 0.35 + horiz_speed * dt;
+            if let Some((toi, hit_n)) = physics.raycast(wall_origin, dir, wall_dist)
+                && hit_n.z.abs() < 0.5
+            {
+                let horiz_n = Vec3::new(hit_n.x, hit_n.y, 0.0).normalize_or_zero();
+                let into = horiz.dot(horiz_n);
+                if into < 0.0 {
+                    let slid = horiz - horiz_n * into;
+                    self.velocity.x = slid.x;
+                    self.velocity.y = slid.y;
+                }
+                if toi < 0.32 {
+                    self.position += horiz_n * (0.32 - toi);
+                }
+            }
+        }
+
         self.position += self.velocity * dt;
 
         // Ground collision probe using Rapier3D physics world
         let ray_origin = self.position + Vec3::new(0.0, 0.0, 1.1);
-        if let Some((toi, _normal)) = physics.raycast(ray_origin, Vec3::NEG_Z, 2.2) {
+        let ray_dist = 2.2 + (-self.velocity.z * dt).max(0.0);
+        if let Some((toi, _normal)) = physics.raycast(ray_origin, Vec3::NEG_Z, ray_dist) {
             let ground_z = ray_origin.z - toi;
-            if self.position.z <= ground_z + 0.05 && self.velocity.z <= 0.0 {
+            if ground_z <= self.position.z + 0.65
+                && self.position.z <= ground_z + 0.05
+                && self.velocity.z <= 0.0
+            {
                 self.position.z = ground_z;
                 self.velocity.z = 0.0;
                 self.grounded = true;

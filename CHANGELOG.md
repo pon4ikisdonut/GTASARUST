@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Dynamic `.col` collision streaming (`10,160` models indexed from `models/coll/*.col`, `gta3.img`, `gta_int.img`), transformed `rapier3d` trimesh/box/sphere static colliders (`25,041` active around Grove Street), on-foot wall sliding, vehicle wall impact damage, and ground-raycast spawning on real Grove Street asphalt (`Z=12.712m`, `BUG-006`).
+- Ambient parked vehicle spawning from binary IPL `CARS` sections (`1,043` entries across San Andreas) in `gtasarust-game`, plus `Car Spawns` reporting in `gtasarust-map-inspector` and binary IPL counting in `gtasarust-asset-pipeline`.
 - Textured RenderWare DFF/TXD per-submesh rendering in `gtasarust-renderer` & `gtasarust-game` (`DffSubMesh`, hierarchical `DffFrame` transforms, vehicle primary/secondary paint tinting, `water.dat` 301-quad ocean/river mesh, and dynamic nearby DFF/TXD sector streaming; verified `68` models / `629` textures preloaded against `E:\gtasa`).
 - Initial project governance, documentation, and issue/PR templates.
 - 24-crate Rust 2024 workspace covering engine, `wgpu` rendering, `rapier3d` physics, `kira` audio, `winit`/`gilrs` input, world streaming, entities, vehicles, weapons, AI, missions, scripting, animation, `egui` UI, save system, asset pipeline, GTA formats, localization, `gtasarust` binary, and 4 CLI inspection/conversion tools (`asset-extractor`, `asset-converter`, `map-inspector`, `model-viewer`).
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform CI workflow for Windows x86_64 (`x86_64-pc-windows-msvc`) and Linux x86_64 (`x86_64-unknown-linux-gnu`).
 
 ### Fixed
+- Fixed binary `bnry` IPL `cars_offset` header read (`0x3C` instead of `0x40`) in `gtasarust-gta-formats` so all 1,043 binary `CARS` generators decode cleanly (`BUG-004`).
 - Fixed alternating odd/even RenderWare `is_tristrip` winding order in `gtasarust-asset-pipeline` and `gtasarust-renderer`, applied hierarchical `DffFrame` world transforms cleanly, and guarded `upload_rgba8_texture` against empty/undersized TXD buffers (`BUG-005`).
 - Enabled `egui/default_fonts` so HUD, main menu, pause menu, and debug inspector text renders properly at runtime.
 - Handled 0-byte audio stream placeholders and `VER2` IMG streaming sector fallback safely.

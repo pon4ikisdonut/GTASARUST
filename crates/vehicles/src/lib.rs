@@ -283,6 +283,35 @@ impl VehicleEntity {
             self.velocity.z -= 9.81 * dt;
         }
 
+        // Horizontal wall impact detection against `.col` static obstacles
+        if !matches!(
+            self.params.class,
+            VehicleClass::Plane | VehicleClass::Helicopter | VehicleClass::Boat
+        ) {
+            let horiz = Vec3::new(self.velocity.x, self.velocity.y, 0.0);
+            let h_speed = horiz.length();
+            if h_speed > 0.1 {
+                let dir = horiz / h_speed;
+                let bumper_origin = self.position + Vec3::new(0.0, 0.0, 0.85);
+                let bumper_dist = 1.6 + h_speed * dt;
+                if let Some((toi, hit_n)) = physics.raycast(bumper_origin, dir, bumper_dist)
+                    && hit_n.z.abs() < 0.5
+                {
+                    let horiz_n = Vec3::new(hit_n.x, hit_n.y, 0.0).normalize_or_zero();
+                    let into = horiz.dot(horiz_n);
+                    if into < 0.0 {
+                        self.apply_damage((-into - 5.0).max(0.0) * 3.0);
+                        let deflected = horiz - horiz_n * (into * 1.25);
+                        self.velocity.x = deflected.x;
+                        self.velocity.y = deflected.y;
+                    }
+                    if toi < 1.5 {
+                        self.position += horiz_n * (1.5 - toi);
+                    }
+                }
+            }
+        }
+
         self.position += self.velocity * dt;
 
         if self.params.class == VehicleClass::Boat {
@@ -292,9 +321,13 @@ impl VehicleEntity {
             }
         } else {
             let probe = self.position + Vec3::new(0.0, 0.0, 1.5);
-            if let Some((toi, _)) = physics.raycast(probe, Vec3::NEG_Z, 2.5) {
+            let probe_dist = 2.5 + (-self.velocity.z * dt).max(0.0);
+            if let Some((toi, _)) = physics.raycast(probe, Vec3::NEG_Z, probe_dist) {
                 let ground_z = probe.z - toi;
-                if self.position.z <= ground_z + 0.05 && self.velocity.z <= 0.0 {
+                if ground_z <= self.position.z + 0.8
+                    && self.position.z <= ground_z + 0.05
+                    && self.velocity.z <= 0.0
+                {
                     self.position.z = ground_z;
                     self.velocity.z = 0.0;
                 }

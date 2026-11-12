@@ -102,7 +102,6 @@ impl IplFile {
         let _unk4 = r.read_u32_le()?;
         let instances_offset = r.read_u32_le()? as usize;
         r.skip(28)?; // unused stream header fields up to 0x3C
-        let _unk5 = r.read_u32_le()?;
         let cars_offset = r.read_u32_le()? as usize;
 
         let mut out = Self::default();
@@ -312,18 +311,29 @@ mod tests {
         assert_eq!(parsed.instances.len(), 1);
         assert_eq!(parsed.instances[0].id, 3563);
 
-        // Synthetic binary IPL with 1 instance at offset 0x4C (76)
-        let mut bin = vec![0u8; 76 + 40];
+        // Synthetic binary IPL with 1 instance at offset 0x4C (76) and 1 car spawn at 0x3C (116)
+        let mut bin = vec![0u8; 76 + 40 + 48];
         bin[0..4].copy_from_slice(b"bnry");
         bin[4..8].copy_from_slice(&1u32.to_le_bytes()); // 1 inst
+        bin[20..24].copy_from_slice(&1u32.to_le_bytes()); // 1 car spawn
         bin[28..32].copy_from_slice(&76u32.to_le_bytes()); // inst offset
+        bin[60..64].copy_from_slice(&116u32.to_le_bytes()); // cars offset at 0x3C
         bin[76..80].copy_from_slice(&100.0f32.to_le_bytes());
         bin[104..108].copy_from_slice(&5390u32.to_le_bytes());
         bin[108..112].copy_from_slice(&0i32.to_le_bytes());
         bin[112..116].copy_from_slice(&(-1i32).to_le_bytes());
+        // Car record at offset 116: pos=(2490.0, -1670.0, 13.3), angle=1.57, car_id=492
+        bin[116..120].copy_from_slice(&2490.0f32.to_le_bytes());
+        bin[120..124].copy_from_slice(&(-1670.0f32).to_le_bytes());
+        bin[124..128].copy_from_slice(&13.3f32.to_le_bytes());
+        bin[128..132].copy_from_slice(&1.57f32.to_le_bytes());
+        bin[132..136].copy_from_slice(&492i32.to_le_bytes());
         let bparsed = IplFile::parse_bytes(&bin).unwrap();
         assert_eq!(bparsed.instances.len(), 1);
         assert_eq!(bparsed.instances[0].id, 5390);
         assert!((bparsed.instances[0].position[0] - 100.0).abs() < 0.01);
+        assert_eq!(bparsed.car_spawns.len(), 1);
+        assert_eq!(bparsed.car_spawns[0].car_id, 492);
+        assert!((bparsed.car_spawns[0].position[2] - 13.3).abs() < 0.01);
     }
 }

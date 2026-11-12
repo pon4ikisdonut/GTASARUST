@@ -5,6 +5,7 @@
 use glam::{Quat, Vec3, Vec4};
 use gtasarust_engine::GameDataRoot;
 use gtasarust_gta_formats::{
+    col::{ColModel, parse_col_archive},
     dat::{GtaDat, TimecycDat, WaterDat, WaterQuad},
     ide::{IdeFile, IdeObjectDef, IdePedDef, IdeVehicleDef},
     img::ImgArchive,
@@ -81,6 +82,7 @@ pub struct WorldManager {
     pub water_quads: Vec<WaterQuad>,
     pub timecyc: TimecycDat,
     pub weather: WeatherType,
+    pub col_models: HashMap<String, ColModel>,
     pub loaded_from_original_data: bool,
 }
 
@@ -125,23 +127,67 @@ impl WorldManager {
             }
         }
 
-        // 3. Load binary streaming IPLs inside `models/gta3.img`
-        if include_binary_ipls
-            && let Ok(gta3_path) = vfs.resolve("models/gta3.img")
-            && let Ok(img) = ImgArchive::open(&gta3_path)
-        {
-            let ipl_entries: Vec<_> = img
-                .entries()
-                .iter()
-                .filter(|e| e.name.to_ascii_lowercase().ends_with(".ipl"))
-                .cloned()
-                .collect();
-            for entry in ipl_entries {
-                if let Ok(bytes) = img.read_entry_data(&entry)
-                    && let Ok(ipl) = IplFile::parse_bytes(&bytes)
+        // 3. Load binary streaming IPLs and collision archives inside `models/gta3.img` & `models/coll/*.col`
+        if include_binary_ipls {
+            for col_rel in default_dat.col_files.iter().chain(gta_dat.col_files.iter()) {
+                if let Ok(bytes) = vfs.read_bytes(col_rel)
+                    && let Ok(parsed) = parse_col_archive(&bytes)
                 {
-                    raw_instances.extend(ipl.instances);
-                    world.car_spawns.extend(ipl.car_spawns);
+                    for model in parsed {
+                        insert_col_model(&mut world.col_models, model);
+                    }
+                }
+            }
+
+            if let Ok(gta3_path) = vfs.resolve("models/gta3.img")
+                && let Ok(img) = ImgArchive::open(&gta3_path)
+            {
+                let mut ipl_entries = Vec::new();
+                let mut col_entries = Vec::new();
+                for entry in img.entries() {
+                    let lower = entry.name.to_ascii_lowercase();
+                    if lower.ends_with(".ipl") {
+                        ipl_entries.push(entry.clone());
+                    } else if lower.ends_with(".col") {
+                        col_entries.push(entry.clone());
+                    }
+                }
+                for entry in ipl_entries {
+                    if let Ok(bytes) = img.read_entry_data(&entry)
+                        && let Ok(ipl) = IplFile::parse_bytes(&bytes)
+                    {
+                        raw_instances.extend(ipl.instances);
+                        world.car_spawns.extend(ipl.car_spawns);
+                    }
+                }
+                for entry in col_entries {
+                    if let Ok(bytes) = img.read_entry_data(&entry)
+                        && let Ok(parsed) = parse_col_archive(&bytes)
+                    {
+                        for model in parsed {
+                            insert_col_model(&mut world.col_models, model);
+                        }
+                    }
+                }
+            }
+
+            if let Ok(gta_int_path) = vfs.resolve("models/gta_int.img")
+                && let Ok(img) = ImgArchive::open(&gta_int_path)
+            {
+                let col_entries: Vec<_> = img
+                    .entries()
+                    .iter()
+                    .filter(|e| e.name.to_ascii_lowercase().ends_with(".col"))
+                    .cloned()
+                    .collect();
+                for entry in col_entries {
+                    if let Ok(bytes) = img.read_entry_data(&entry)
+                        && let Ok(parsed) = parse_col_archive(&bytes)
+                    {
+                        for model in parsed {
+                            insert_col_model(&mut world.col_models, model);
+                        }
+                    }
                 }
             }
         }
@@ -165,6 +211,8 @@ impl WorldManager {
             vehicles = world.vehicles.len(),
             sectors = world.sectors.len(),
             placements = world.total_placements(),
+            car_spawns = world.car_spawns.len(),
+            col_models = world.col_models.len(),
             zones = world.zones.len(),
             water_quads = world.water_quads.len(),
             "World definitions loaded"
@@ -382,6 +430,23 @@ impl WorldManager {
             fog_end,
             rain_intensity,
         }
+    }
+}
+
+fn insert_col_model(map: &mut HashMap<String, ColModel>, model: ColModel) {
+    let key = model.name.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    let incoming_geom = model.faces.len() + model.boxes.len() + model.spheres.len();
+    let replace = match map.get(&key) {
+        None => true,
+        Some(existing) => {
+            incoming_geom > existing.faces.len() + existing.boxes.len() + existing.spheres.len()
+        }
+    };
+    if replace {
+        map.insert(key, model);
     }
 }
 

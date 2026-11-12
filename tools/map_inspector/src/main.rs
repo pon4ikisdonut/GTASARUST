@@ -22,12 +22,13 @@ fn main() -> Result<()> {
     let vfs = GameDataRoot::open(&cli.game_dir)?;
     let world = WorldManager::load_from_game_dir(&vfs, cli.include_binary_ipls);
     println!(
-        "Objects: {}, Vehicles: {}, Peds: {}, Sectors: {}, Total Placements: {}, Zones: {}, Water Quads: {}",
+        "Objects: {}, Vehicles: {}, Peds: {}, Sectors: {}, Total Placements: {}, Car Spawns: {}, Zones: {}, Water Quads: {}",
         world.objects.len(),
         world.vehicles.len(),
         world.peds.len(),
         world.sectors.len(),
         world.total_placements(),
+        world.car_spawns.len(),
         world.zones.len(),
         world.water_quads.len(),
     );

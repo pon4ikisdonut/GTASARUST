@@ -73,6 +73,8 @@ pub fn inspect_installation(game_dir: &Path) -> Result<InstallationReport, Pipel
 
     let mut archives = Vec::new();
     let mut img_entry_set: HashSet<String> = HashSet::new();
+    let mut img_ipl_instance_count = 0usize;
+    let mut img_ipl_car_spawn_count = 0usize;
 
     for rel in img_paths {
         match vfs.resolve(&rel) {
@@ -82,6 +84,7 @@ pub fn inspect_installation(game_dir: &Path) -> Result<InstallationReport, Pipel
                     let mut txd_count = 0usize;
                     let mut col_count = 0usize;
                     let mut ipl_count = 0usize;
+                    let mut binary_ipl_entries = Vec::new();
                     for entry in img.entries() {
                         let lower = entry.name.to_ascii_lowercase();
                         img_entry_set.insert(lower.clone());
@@ -93,6 +96,15 @@ pub fn inspect_installation(game_dir: &Path) -> Result<InstallationReport, Pipel
                             col_count += 1;
                         } else if lower.ends_with(".ipl") {
                             ipl_count += 1;
+                            binary_ipl_entries.push(entry.clone());
+                        }
+                    }
+                    for entry in binary_ipl_entries {
+                        if let Ok(bytes) = img.read_entry_data(&entry)
+                            && let Ok(ipl) = IplFile::parse_bytes(&bytes)
+                        {
+                            img_ipl_instance_count += ipl.instances.len();
+                            img_ipl_car_spawn_count += ipl.car_spawns.len();
                         }
                     }
                     archives.push(ArchiveSummary {
@@ -150,11 +162,11 @@ pub fn inspect_installation(game_dir: &Path) -> Result<InstallationReport, Pipel
         }
     }
 
-    // Parse all text IPL placements
+    // Parse all text IPL placements + binary streaming IPLs indexed above
     let mut ipl_files = default_dat.ipl_files;
     ipl_files.extend(gta_dat.ipl_files);
-    let mut ipl_instance_count = 0usize;
-    let mut ipl_car_spawn_count = 0usize;
+    let mut ipl_instance_count = img_ipl_instance_count;
+    let mut ipl_car_spawn_count = img_ipl_car_spawn_count;
     for rel in &ipl_files {
         match vfs.read_bytes(rel) {
             Ok(bytes) => {

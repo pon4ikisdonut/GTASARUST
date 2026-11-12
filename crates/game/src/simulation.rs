@@ -13,7 +13,7 @@ use gtasarust_gta_formats::{
 use gtasarust_input::{ActionFrameState, ControlMode, InputManager};
 use gtasarust_localization::LocalizationTable;
 use gtasarust_missions::MissionManager;
-use gtasarust_physics::PhysicsWorld;
+use gtasarust_physics::{ColliderHandle, PhysicsWorld};
 use gtasarust_renderer::{
     CameraState, GpuMeshHandle, InstanceData, RenderInstanceBatch, SceneRenderer, mesh::CpuMeshData,
 };
@@ -22,7 +22,7 @@ use gtasarust_scripting::ScmVm;
 use gtasarust_ui::{GameUiState, ScreenState, UiActionQueue};
 use gtasarust_vehicles::{VehicleClass, VehicleManager, VehicleSpawnSpec};
 use gtasarust_weapons::WeaponInventory;
-use gtasarust_world::WorldManager;
+use gtasarust_world::{SectorCoord, WorldManager};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
@@ -65,6 +65,7 @@ pub struct GameWorldState {
     pub loaded_txds: HashSet<String>,
     pub cached_dff_meshes: HashMap<String, CachedDffModel>,
     pub failed_dff_lookups: HashSet<String>,
+    pub sector_colliders: HashMap<SectorCoord, Vec<ColliderHandle>>,
     pub water_mesh: Option<GpuMeshHandle>,
 }
 
@@ -171,7 +172,7 @@ impl GameWorldState {
         let mut camera = CameraState::default();
         camera.update_third_person(player.position, player.yaw, player.pitch, 6.5);
 
-        Self {
+        let mut state = Self {
             config,
             host,
             timestep: FixedTimestep::default(),
@@ -197,8 +198,24 @@ impl GameWorldState {
             loaded_txds: HashSet::new(),
             cached_dff_meshes: HashMap::new(),
             failed_dff_lookups: HashSet::new(),
+            sector_colliders: HashMap::new(),
             water_mesh: None,
+        };
+        if state.world.loaded_from_original_data {
+            state.spawn_nearby_ipl_vehicles(260.0, 20);
         }
+        state
+            .world
+            .update_streaming(state.player.position, state.config.graphics.draw_distance);
+        state.sync_collision_sectors();
+        state.snap_initial_spawns_to_ground();
+        state.camera.update_third_person(
+            state.player.position,
+            state.player.yaw,
+            state.player.pitch,
+            6.5,
+        );
+        state
     }
 
     fn read_archive_entry(&self, entry_name: &str) -> Option<Vec<u8>> {
@@ -416,6 +433,215 @@ impl GameWorldState {
         loaded
     }
 
+    /// Keep `PhysicsWorld` static `.col` colliders synchronized with active world sectors.
+    pub fn sync_collision_sectors(&mut self) {
+        if self.world.col_models.is_empty() {
+            return;
+        }
+        let interior = self.player.interior_zero();
+        let stale: Vec<SectorCoord> = self
+            .sector_colliders
+            .keys()
+            .copied()
+            .filter(|sc| !self.world.active_sectors.contains(sc))
+            .collect();
+        let mut changed = false;
+        for sc in stale {
+            if let Some(handles) = self.sector_colliders.remove(&sc) {
+                for h in handles {
+                    self.physics.remove_collider(h);
+                }
+                changed = true;
+            }
+        }
+
+        let new_sectors: Vec<SectorCoord> = self
+            .world
+            .active_sectors
+            .iter()
+            .copied()
+            .filter(|sc| !self.sector_colliders.contains_key(sc))
+            .collect();
+        for sc in new_sectors {
+            let mut handles = Vec::new();
+            if let Some(placements) = self.world.sectors.get(&sc) {
+                for p in placements {
+                    if p.interior != interior || p.is_lod {
+                        continue;
+                    }
+                    let key = p.model_name.to_ascii_lowercase();
+                    let Some(col) = self.world.col_models.get(&key) else {
+                        continue;
+                    };
+                    for b in &col.boxes {
+                        let bmin = Vec3::from_array(b.min);
+                        let bmax = Vec3::from_array(b.max);
+                        handles.push(self.physics.add_static_oriented_box(
+                            (bmin + bmax) * 0.5,
+                            (bmax - bmin) * 0.5,
+                            p.position,
+                            p.rotation,
+                        ));
+                    }
+                    for s in &col.spheres {
+                        handles.push(self.physics.add_static_sphere(
+                            Vec3::from_array(s.center),
+                            s.radius,
+                            p.position,
+                            p.rotation,
+                        ));
+                    }
+                    if !col.vertices.is_empty() && !col.faces.is_empty() {
+                        let tris: Vec<[u32; 3]> = col
+                            .faces
+                            .iter()
+                            .map(|f| {
+                                [
+                                    u32::from(f.indices[0]),
+                                    u32::from(f.indices[1]),
+                                    u32::from(f.indices[2]),
+                                ]
+                            })
+                            .collect();
+                        if let Some(h) = self.physics.add_static_transformed_trimesh(
+                            &col.vertices,
+                            &tris,
+                            p.position,
+                            p.rotation,
+                        ) {
+                            handles.push(h);
+                        }
+                    }
+                }
+            }
+            if !handles.is_empty() {
+                changed = true;
+            }
+            self.sector_colliders.insert(sc, handles);
+        }
+
+        if changed {
+            self.physics.sync_queries();
+        }
+    }
+
+    /// Spawn nearby ambient parked vehicles parsed from binary/text IPL `CARS` sections.
+    fn spawn_nearby_ipl_vehicles(&mut self, max_dist: f32, max_count: usize) {
+        if self.world.car_spawns.is_empty() {
+            return;
+        }
+        const FALLBACK_EAST_LS_CARS: [u32; 8] = [492, 467, 542, 405, 426, 445, 517, 534];
+        let mut candidates: Vec<(f32, usize)> = self
+            .world
+            .car_spawns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cs)| {
+                let pos = Vec3::from_array(cs.position);
+                let d2 = pos
+                    .truncate()
+                    .distance_squared(self.player.position.truncate());
+                (d2 <= max_dist * max_dist).then_some((d2, idx))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut spawned = 0usize;
+        for (_, idx) in candidates {
+            if spawned >= max_count {
+                break;
+            }
+            let cs = &self.world.car_spawns[idx];
+            let pos = Vec3::from_array(cs.position);
+            if self
+                .vehicles
+                .vehicles
+                .iter()
+                .any(|v| v.position.truncate().distance_squared(pos.truncate()) < 36.0)
+            {
+                continue;
+            }
+            let model_id = if cs.car_id > 0 {
+                cs.car_id as u32
+            } else {
+                FALLBACK_EAST_LS_CARS[idx % FALLBACK_EAST_LS_CARS.len()]
+            };
+            let Some(def) = self.world.vehicles.get(&model_id) else {
+                continue;
+            };
+            let class = vehicle_class_from_ide(&def.vehicle_type);
+            if class == VehicleClass::Boat || def.vehicle_type.eq_ignore_ascii_case("trailer") {
+                continue;
+            }
+            let palette_idx = if cs.color1 >= 0 {
+                cs.color1 as usize
+            } else {
+                idx
+            };
+            let color1 = sample_sa_car_color(palette_idx);
+            self.vehicles.spawn(VehicleSpawnSpec {
+                model_id,
+                name: &def.handling_id,
+                class,
+                position: pos + Vec3::new(0.0, 0.0, 0.15),
+                yaw: cs.angle,
+                color1,
+                handling: self.handling.as_ref(),
+            });
+            spawned += 1;
+        }
+    }
+
+    /// Project initial Grove Street spawns onto real `.col` road/terrain elevation when available.
+    fn snap_initial_spawns_to_ground(&mut self) {
+        if self.world.col_models.is_empty() {
+            return;
+        }
+        if let Some(gz) = self.physics.ground_height_below(
+            self.player.position.x,
+            self.player.position.y,
+            24.0,
+            26.0,
+        ) && gz > 0.5
+        {
+            self.player.position.z = gz + 0.05;
+            self.player.velocity.z = 0.0;
+            self.player.grounded = true;
+        }
+        for veh in &mut self.vehicles.vehicles {
+            let ceiling = if veh.position.z > 2.0 {
+                veh.position.z + 2.5
+            } else {
+                24.0
+            };
+            if let Some(gz) = self.physics.ground_height_below(
+                veh.position.x,
+                veh.position.y,
+                ceiling,
+                ceiling + 2.0,
+            ) && gz > 0.5
+            {
+                veh.position.z = gz + 0.08;
+                veh.velocity.z = 0.0;
+            }
+        }
+        for ped in &mut self.ai.pedestrians {
+            if let Some(gz) =
+                self.physics
+                    .ground_height_below(ped.position.x, ped.position.y, 24.0, 26.0)
+                && gz > 0.5
+            {
+                ped.position.z = gz + 0.05;
+            }
+        }
+        info!(
+            player_pos = ?self.player.position,
+            colliders = self.physics.collider_set.len(),
+            vehicles = self.vehicles.vehicles.len(),
+            "World physics and initial spawns grounded on COL surfaces"
+        );
+    }
+
     pub fn step_frame(&mut self, frame_dt: f32) {
         let actions = self.input.sample_actions(
             self.config.controls.mouse_sensitivity,
@@ -530,12 +756,18 @@ impl GameWorldState {
             self.player.life_state,
             PlayerLifeState::Wasted | PlayerLifeState::Busted
         ) {
+            let hospital_z = self
+                .physics
+                .ground_height_below(2033.0, -1416.0, 35.0, 40.0)
+                .map(|z| z + 0.1)
+                .unwrap_or(17.0);
             self.player
-                .respawn_at_hospital(Vec3::new(2033.0, -1416.0, 1.0));
+                .respawn_at_hospital(Vec3::new(2033.0, -1416.0, hospital_z));
         }
 
         self.world
             .update_streaming(self.player.position, self.config.graphics.draw_distance);
+        self.sync_collision_sectors();
 
         let cam_dist = if self.player.control_mode == ControlMode::InVehicle {
             9.5
@@ -560,6 +792,10 @@ impl GameWorldState {
                 .weapons
                 .give_weapon(WeaponInventory::preset_colt45(), 51);
             self.missions = MissionManager::new_san_andreas_campaign();
+            self.world
+                .update_streaming(self.player.position, self.config.graphics.draw_distance);
+            self.sync_collision_sectors();
+            self.snap_initial_spawns_to_ground();
         }
         if let Some(w) = actions.set_weather {
             self.world.weather = w;
@@ -581,6 +817,16 @@ impl GameWorldState {
             self.player.position = tp;
             self.player.current_vehicle = None;
             self.player.control_mode = ControlMode::OnFoot;
+            self.world
+                .update_streaming(self.player.position, self.config.graphics.draw_distance);
+            self.sync_collision_sectors();
+            if tp.z < 1.0
+                && !self.world.col_models.is_empty()
+                && let Some(gz) = self.physics.ground_height_below(tp.x, tp.y, 120.0, 140.0)
+                && gz > 0.5
+            {
+                self.player.position.z = gz + 0.1;
+            }
         }
         if let Some(slot) = actions.save_to_slot {
             let data = self.to_save_data(slot);
@@ -661,7 +907,7 @@ impl GameWorldState {
     pub fn collect_render_batches(&self, renderer: &SceneRenderer) -> Vec<RenderInstanceBatch> {
         let frustum = self.camera.frustum();
         let ground_z = if self.world.loaded_from_original_data {
-            -0.08
+            -0.25
         } else {
             0.0
         };
@@ -875,4 +1121,29 @@ fn apply_vehicle_paint_tint(mat_col: [f32; 4], color1: [f32; 3], color2: [f32; 3
     } else {
         mat_col
     }
+}
+
+fn vehicle_class_from_ide(vt: &str) -> VehicleClass {
+    match vt.trim().to_ascii_lowercase().as_str() {
+        "bike" => VehicleClass::Motorcycle,
+        "bmx" => VehicleClass::Bicycle,
+        "boat" => VehicleClass::Boat,
+        "plane" => VehicleClass::Plane,
+        "heli" => VehicleClass::Helicopter,
+        _ => VehicleClass::Car,
+    }
+}
+
+fn sample_sa_car_color(idx: usize) -> [f32; 3] {
+    const PALETTE: [[f32; 3]; 8] = [
+        [0.14, 0.36, 0.18], // Grove Forest Green
+        [0.65, 0.14, 0.14], // LS Crimson
+        [0.18, 0.32, 0.56], // Pacific Blue
+        [0.72, 0.68, 0.58], // Desert Silver-Beige
+        [0.24, 0.25, 0.27], // Gunmetal Gray
+        [0.82, 0.62, 0.14], // Yellow Taxi/Taxi Gold
+        [0.85, 0.85, 0.85], // Pearl White
+        [0.36, 0.16, 0.42], // Ballas Purple
+    ];
+    PALETTE[idx % PALETTE.len()]
 }

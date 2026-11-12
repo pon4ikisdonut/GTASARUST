@@ -7,8 +7,8 @@ Tracks feature parity between the original *Grand Theft Auto: San Andreas* (PC v
 | **Assets & Formats** | IMG v2 (`gta3.img`, `gta_int.img`, `player.img`, `cutscene.img`) | Tested (`E:\gtasa`, 8 archives) | `gtasarust-gta-formats` |
 | **Assets & Formats** | DFF RenderWare Clump / Geometry / FrameList / Materials | Tested (15,334 DFFs indexed; textured `DffSubMesh` + frame hierarchy rendered) | `gtasarust-gta-formats`, `gtasarust-renderer` |
 | **Assets & Formats** | TXD RenderWare TextureDictionary (DXT1/3/5, RGBA, Palettized) | Tested (3,983 archives indexed; runtime TXD texture streaming uploaded `629` textures) | `gtasarust-gta-formats`, `gtasarust-renderer` |
-| **Assets & Formats** | COL1 / COL2 / COL3 / COL4 collision archives | Tested (257 COL entries indexed; physics attachment pending) | `gtasarust-gta-formats` |
-| **Assets & Formats** | IDE object/vehicle/ped definitions & text/binary IPL placements | Tested (14,344 objects, 45,837 placements loaded) | `gtasarust-gta-formats` |
+| **Assets & Formats** | COL1 / COL2 / COL3 / COL4 collision archives | Tested (`10,160` models indexed & attached as active-sector `rapier3d` colliders) | `gtasarust-gta-formats`, `gtasarust-physics` |
+| **Assets & Formats** | IDE object/vehicle/ped definitions & text/binary IPL placements | Tested (14,344 objects, 45,837 placements, 1,043 binary `CARS` loaded) | `gtasarust-gta-formats`, `gtasarust-world` |
 | **Assets & Formats** | GXT localization tables (`american.gxt`, etc.) | Tested (16,588 entries parsed & queried) | `gtasarust-gta-formats`, `gtasarust-localization` |
 | **Assets & Formats** | `handling.cfg`, `weapon.dat`, `timecyc.dat`, `water.dat`, `carcols.dat` | Tested (210 handling, 30 weapons, 184 timecyc, 301 water quads) | `gtasarust-gta-formats` |
 | **Assets & Formats** | IFP (`ANPK` / `ANP3`) skeletal animations | In progress (294 `ped.ifp` clips indexed; full bone playback pending) | `gtasarust-gta-formats`, `gtasarust-animation` |
