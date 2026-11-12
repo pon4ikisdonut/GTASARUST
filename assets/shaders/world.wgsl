@@ -60,7 +60,12 @@ fn vs_main(vert: VertexInput, inst: InstanceInput) -> VertexOutput {
     out.clip_pos = frame.view_proj * world_p;
     out.world_pos = world_p.xyz;
     out.world_normal = world_n;
-    out.uv = vert.uv;
+    let is_water = inst.light_params.x > 2.5;
+    out.uv = select(
+        vert.uv,
+        vert.uv + vec2<f32>(frame.fog_params.z * 0.09, frame.fog_params.z * 0.06),
+        is_water,
+    );
     out.color = vert.color * inst.tint;
     out.night_color = vert.night_color * inst.tint;
     out.light_params = inst.light_params;

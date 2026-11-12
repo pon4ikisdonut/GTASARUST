@@ -148,7 +148,38 @@ impl PhysicsWorld {
         Some(self.collider_set.insert(collider))
     }
 
-    /// Remove a previously registered static collider (e.g., when a streaming sector unloads).
+    /// Add a dynamic/kinematic box collider whose pose updates per tick (e.g., vehicles)
+    /// and carries `user_data` for selective raycast filtering and damage attribution.
+    pub fn add_kinematic_box(
+        &mut self,
+        half_extents: Vec3,
+        position: Vec3,
+        rotation: Quat,
+        user_data: u128,
+    ) -> ColliderHandle {
+        let axis = rotation.normalize().to_scaled_axis();
+        let collider = ColliderBuilder::cuboid(
+            half_extents.x.max(0.1),
+            half_extents.y.max(0.1),
+            half_extents.z.max(0.1),
+        )
+        .translation(Vector::new(position.x, position.y, position.z))
+        .rotation(AngVector::new(axis.x, axis.y, axis.z))
+        .user_data(user_data)
+        .build();
+        self.collider_set.insert(collider)
+    }
+
+    /// Update the world-space position and orientation of an existing collider in-place.
+    pub fn update_collider_pose(&mut self, handle: ColliderHandle, position: Vec3, rotation: Quat) {
+        if let Some(col) = self.collider_set.get_mut(handle) {
+            let q = rotation.normalize();
+            col.set_translation(Vector::new(position.x, position.y, position.z));
+            col.set_rotation(rapier3d::math::Rotation::from_xyzw(q.x, q.y, q.z, q.w));
+        }
+    }
+
+    /// Remove a previously registered collider (e.g., when a streaming sector or vehicle unloads).
     pub fn remove_collider(&mut self, handle: ColliderHandle) {
         self.collider_set.remove(
             handle,
@@ -179,19 +210,59 @@ impl PhysicsWorld {
 
     /// Cast a ray in Z-up world space and return hit distance and surface normal.
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<(f32, Vec3)> {
+        self.raycast_with_tag(origin, dir, max_dist, None)
+            .map(|(toi, n, _)| (toi, n))
+    }
+
+    /// Cast a ray excluding colliders whose `user_data` equals `excluded_user_data`,
+    /// returning `(toi, normal, hit_user_data)`.
+    pub fn raycast_excluding(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        excluded_user_data: u128,
+    ) -> Option<(f32, Vec3, u128)> {
+        self.raycast_with_tag(origin, dir, max_dist, Some(excluded_user_data))
+    }
+
+    fn raycast_with_tag(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        max_dist: f32,
+        excluded_user_data: Option<u128>,
+    ) -> Option<(f32, Vec3, u128)> {
+        let mut filter = QueryFilter::default();
+        let pred = |_: ColliderHandle, col: &Collider| {
+            excluded_user_data.is_none_or(|ex| col.user_data != ex)
+        };
+        if excluded_user_data.is_some() {
+            filter = filter.predicate(&pred);
+        }
         let query_pipeline = self.broad_phase.as_query_pipeline(
             self.narrow_phase.query_dispatcher(),
             &self.rigid_body_set,
             &self.collider_set,
-            QueryFilter::default(),
+            filter,
         );
         let ray = Ray::new(
             Vector::new(origin.x, origin.y, origin.z),
             Vector::new(dir.x, dir.y, dir.z),
         );
-        let (_, intersection) = query_pipeline.cast_ray_and_get_normal(&ray, max_dist, true)?;
+        let (handle, intersection) =
+            query_pipeline.cast_ray_and_get_normal(&ray, max_dist, true)?;
         let n = intersection.normal;
-        Some((intersection.time_of_impact, Vec3::new(n.x, n.y, n.z)))
+        let hit_tag = self
+            .collider_set
+            .get(handle)
+            .map(|c| c.user_data)
+            .unwrap_or(0);
+        Some((
+            intersection.time_of_impact,
+            Vec3::new(n.x, n.y, n.z),
+            hit_tag,
+        ))
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -272,5 +343,38 @@ mod tests {
             .ground_height_below(2490.0, -1670.0, 30.0, 40.0)
             .expect("base plane hit");
         assert!(fallback_z.abs() < 0.05, "got {fallback_z}");
+    }
+
+    #[test]
+    fn kinematic_collider_moves_and_filters_raycast() {
+        let mut world = PhysicsWorld::new();
+        let tag = 0x5645_4800_0000_0007_u128;
+        let handle = world.add_kinematic_box(
+            Vec3::new(2.0, 1.0, 1.0),
+            Vec3::new(10.0, 0.0, 1.0),
+            Quat::IDENTITY,
+            tag,
+        );
+        world.sync_queries();
+
+        let hit = world
+            .raycast_excluding(Vec3::ZERO + Vec3::Z, Vec3::X, 20.0, 0)
+            .expect("should hit vehicle box");
+        assert!((hit.0 - 8.0).abs() < 0.05);
+        assert_eq!(hit.2, tag);
+
+        assert!(
+            world
+                .raycast_excluding(Vec3::ZERO + Vec3::Z, Vec3::X, 20.0, tag)
+                .is_none(),
+            "excluded tag should bypass collider"
+        );
+
+        world.update_collider_pose(handle, Vec3::new(15.0, 0.0, 1.0), Quat::IDENTITY);
+        world.sync_queries();
+        let moved_hit = world
+            .raycast_excluding(Vec3::ZERO + Vec3::Z, Vec3::X, 20.0, 0)
+            .expect("should hit moved vehicle box");
+        assert!((moved_hit.0 - 13.0).abs() < 0.05);
     }
 }

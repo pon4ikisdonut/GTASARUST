@@ -110,6 +110,10 @@ pub struct GameUiState {
     pub screen: ScreenState,
     pub show_dev_overlay: bool,
     pub status_message: Option<String>,
+    pub is_aiming: bool,
+    pub screen_fade_alpha: f32,
+    pub hud_visible_override: Option<bool>,
+    pub radar_visible_override: Option<bool>,
     pub media: UiMediaCache,
 }
 
@@ -119,6 +123,10 @@ impl Default for GameUiState {
             screen: ScreenState::Playing,
             show_dev_overlay: false,
             status_message: None,
+            is_aiming: false,
+            screen_fade_alpha: 0.0,
+            hud_visible_override: None,
+            radar_visible_override: None,
             media: UiMediaCache::default(),
         }
     }
@@ -220,7 +228,13 @@ pub fn build_game_ui(
             draw_save_load_screen(ctx, ui_state, &mut actions);
         }
         ScreenState::Playing => {
-            if config.game.show_hud {
+            let show_hud = ui_state
+                .hud_visible_override
+                .unwrap_or(config.game.show_hud);
+            let show_radar = ui_state
+                .radar_visible_override
+                .unwrap_or(config.game.show_radar);
+            if show_hud {
                 draw_sa_hud(
                     ctx,
                     &mut ui_state.media,
@@ -231,10 +245,24 @@ pub fn build_game_ui(
                     missions,
                     radio_name,
                     ui_state.status_message.as_deref(),
-                    config.game.show_radar,
+                    show_radar,
+                    ui_state.is_aiming,
                 );
             }
         }
+    }
+
+    if ui_state.screen_fade_alpha > 0.004 {
+        let fade_a = (ui_state.screen_fade_alpha.clamp(0.0, 1.0) * 255.0) as u8;
+        let fade_painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("sa_screen_fade"),
+        ));
+        fade_painter.rect_filled(
+            ctx.content_rect(),
+            0.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, fade_a),
+        );
     }
 
     if ui_state.show_dev_overlay {
@@ -303,6 +331,7 @@ fn draw_sa_hud(
     radio_name: &str,
     status_message: Option<&str>,
     show_radar: bool,
+    is_aiming: bool,
 ) {
     let rect = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -311,19 +340,57 @@ fn draw_sa_hud(
     ));
 
     if let Some(msg) = status_message {
-        let help_box = Rect::from_min_size(Pos2::new(26.0, 26.0), Vec2::new(360.0, 44.0));
+        let mut job = egui::text::LayoutJob::default();
+        for span in LocalizationTable::parse_sa_rich_text(msg, [238, 238, 238]) {
+            job.append(
+                &span.text,
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(15.0),
+                    color: Color32::from_rgb(span.color[0], span.color[1], span.color[2]),
+                    ..Default::default()
+                },
+            );
+        }
+        let galley = painter.layout_job(job);
+        let box_w = (galley.size().x + 28.0).clamp(240.0, 440.0);
+        let box_h = (galley.size().y + 18.0).max(40.0);
+        let help_box = Rect::from_min_size(Pos2::new(26.0, 26.0), Vec2::new(box_w, box_h));
         painter.rect_filled(
             help_box,
             CornerRadius::same(4),
-            Color32::from_rgba_unmultiplied(8, 10, 14, 200),
+            Color32::from_rgba_unmultiplied(8, 10, 14, 205),
         );
-        painter.text(
-            help_box.left_center() + Vec2::new(12.0, 0.0),
-            Align2::LEFT_CENTER,
-            msg,
-            FontId::proportional(15.0),
+        painter.galley(
+            help_box.min + Vec2::new(14.0, 9.0),
+            galley,
             Color32::from_rgb(238, 238, 238),
         );
+    }
+
+    // Center OTS aiming reticle (`siteM16` from `hud.txd` or crisp SA crosshair fallback)
+    if is_aiming && player.life_state == PlayerLifeState::Alive {
+        let center = rect.center();
+        if let Some(reticle_id) = media.hud_sprite_id(ctx, "sitem16") {
+            painter.image(
+                reticle_id,
+                Rect::from_center_size(center, Vec2::splat(44.0)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::from_rgba_unmultiplied(245, 245, 245, 225),
+            );
+        } else {
+            let stroke = Stroke::new(1.8, Color32::from_rgba_unmultiplied(240, 240, 240, 220));
+            painter.circle_stroke(center, 13.0, stroke);
+            painter.circle_filled(center, 2.0, Color32::from_rgb(220, 45, 45));
+            for dir in [
+                Vec2::new(1.0, 0.0),
+                Vec2::new(-1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+                Vec2::new(0.0, -1.0),
+            ] {
+                painter.line_segment([center + dir * 7.0, center + dir * 18.0], stroke);
+            }
+        }
     }
 
     // Top-right GTA:SA cluster: Weapon box + Clock + Money + Health + Armor + Wanted stars
@@ -344,10 +411,10 @@ fn draw_sa_hud(
         egui::StrokeKind::Inside,
     );
     if let Some(w) = player.weapons.active() {
-        let is_unarmed = w.spec.name.eq_ignore_ascii_case("Fist");
-        if is_unarmed && let Some(fist_id) = media.hud_sprite_id(ctx, "fist") {
+        let icon_name = weapon_hud_sprite_name(&w.spec.name);
+        if let Some(tex_id) = media.hud_sprite_id(ctx, icon_name) {
             painter.image(
-                fist_id,
+                tex_id,
                 w_box.shrink(8.0),
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 Color32::WHITE,
@@ -392,14 +459,25 @@ fn draw_sa_hud(
         Color32::from_rgb(180, 25, 29),
     );
 
-    // Armor bar (if > 0)
+    // Armor & underwater breath bars
+    let mut sub_y = top_y + 58.0;
     if player.armor > 0.0 {
         let arm_frac = (player.armor / 100.0).clamp(0.0, 1.0);
         draw_sa_bar(
             &painter,
-            Rect::from_min_size(Pos2::new(bar_x, top_y + 58.0), Vec2::new(bar_w, 10.0)),
+            Rect::from_min_size(Pos2::new(bar_x, sub_y), Vec2::new(bar_w, 10.0)),
             arm_frac,
             Color32::from_rgb(220, 228, 230),
+        );
+        sub_y += 14.0;
+    }
+    if player.in_water || player.breath < 99.5 {
+        let breath_frac = (player.breath / 100.0).clamp(0.0, 1.0);
+        draw_sa_bar(
+            &painter,
+            Rect::from_min_size(Pos2::new(bar_x, sub_y), Vec2::new(bar_w, 10.0)),
+            breath_frac,
+            Color32::from_rgb(135, 195, 240),
         );
     }
 
@@ -633,14 +711,49 @@ fn draw_sa_hud(
     }
 
     if let Some(obj) = missions.current_objective_text() {
-        let clean = LocalizationTable::strip_sa_tags(obj);
-        painter.text(
-            Pos2::new(rect.center().x, rect.max.y - 36.0),
-            Align2::CENTER_BOTTOM,
-            clean,
-            FontId::proportional(20.0),
-            Color32::WHITE,
+        let mut job = egui::text::LayoutJob {
+            halign: egui::Align::Center,
+            ..Default::default()
+        };
+        for span in LocalizationTable::parse_sa_rich_text(obj, [235, 235, 235]) {
+            job.append(
+                &span.text,
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(20.0),
+                    color: Color32::from_rgb(span.color[0], span.color[1], span.color[2]),
+                    ..Default::default()
+                },
+            );
+        }
+        let galley = painter.layout_job(job);
+        let text_pos = Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.max.y - 36.0 - galley.size().y,
         );
+        let bg = Rect::from_min_size(text_pos, galley.size()).expand2(Vec2::new(12.0, 5.0));
+        painter.rect_filled(
+            bg,
+            CornerRadius::same(4),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 155),
+        );
+        painter.galley(text_pos, galley, Color32::WHITE);
+    }
+}
+
+fn weapon_hud_sprite_name(spec_name: &str) -> &'static str {
+    match spec_name.to_ascii_lowercase().as_str() {
+        "fist" => "fist",
+        "9mm" | "colt45" => "colt45icon",
+        "desert_eagle" | "deagle" => "desert_eagleicon",
+        "shotgun" | "chromegun" => "chromegunicon",
+        "mp5" | "mp5lng" => "mp5lngicon",
+        "ak47" => "ak47icon",
+        "m4" => "m4icon",
+        "sniper" => "snipericon",
+        "bat" => "baticon",
+        "knifecur" | "knife" => "knifecuricon",
+        _ => "fist",
     }
 }
 

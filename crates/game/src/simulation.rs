@@ -1,7 +1,10 @@
 use anyhow::Result;
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use gtasarust_ai::{AiSimulation, CrimeEvent, PedBehavior};
-use gtasarust_animation::{AnimState, AnimationController, IfpPoseLibrary, compute_skin_matrices};
+use gtasarust_animation::{
+    AnimState, AnimationController, BONE_R_HAND, IfpPoseLibrary, compute_bone_world_matrix,
+    compute_skin_matrices,
+};
 use gtasarust_audio::{AudioEngine, SfxCue};
 use gtasarust_engine::{EngineConfig, FixedTimestep, GameClock, GameDataRoot, HostInfo};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
@@ -34,6 +37,9 @@ use gtasarust_weapons::{WeaponInventory, WeaponKind};
 use gtasarust_world::{SectorCoord, WeatherType, WorldManager};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
+
+const VEHICLE_COLLIDER_TAG_FLAG: u128 = 0x5645_4800_0000_0000;
+const VEHICLE_COLLIDER_TAG_MASK: u128 = 0xFFFF_FFFF_0000_0000;
 
 #[derive(Debug, Clone)]
 pub struct CachedSubMesh {
@@ -111,9 +117,19 @@ pub struct GameWorldState {
     skin_vertex_scratch: Vec<Vertex3D>,
     pub failed_dff_lookups: HashSet<String>,
     pub sector_colliders: HashMap<SectorCoord, Vec<ColliderHandle>>,
+    pub vehicle_colliders: HashMap<u64, ColliderHandle>,
     pub loaded_collider_interior: i32,
     pub water_mesh: Option<GpuMeshHandle>,
+    pub water_tex: Option<usize>,
+    pub shadow_quad_mesh: Option<GpuMeshHandle>,
+    pub shad_ped_tex: Option<usize>,
+    pub shad_car_tex: Option<usize>,
     pub marker_mesh: Option<GpuMeshHandle>,
+    pub cj_right_hand_local: Option<Mat4>,
+    pub fade_alpha: f32,
+    pub fade_target: f32,
+    pub fade_rate: f32,
+    pub active_explosions: Vec<(Vec3, f32)>,
     pub scm_pickups: Vec<(Vec3, i32)>,
     pub scm_blips: Vec<(Vec3, u8)>,
     pub enex_cooldown: f32,
@@ -302,9 +318,19 @@ impl GameWorldState {
             skin_vertex_scratch: Vec::new(),
             failed_dff_lookups: HashSet::new(),
             sector_colliders: HashMap::new(),
+            vehicle_colliders: HashMap::new(),
             loaded_collider_interior: 0,
             water_mesh: None,
+            water_tex: None,
+            shadow_quad_mesh: None,
+            shad_ped_tex: None,
+            shad_car_tex: None,
             marker_mesh: None,
+            cj_right_hand_local: None,
+            fade_alpha: 0.0,
+            fade_target: 0.0,
+            fade_rate: 1.0,
+            active_explosions: Vec::new(),
             scm_pickups: Vec::new(),
             scm_blips: Vec::new(),
             enex_cooldown: 0.0,
@@ -329,14 +355,30 @@ impl GameWorldState {
     }
 
     fn update_player_camera(&mut self) {
+        let excluded_tag = self
+            .player
+            .current_vehicle
+            .map(|vid| VEHICLE_COLLIDER_TAG_FLAG | u128::from(vid))
+            .unwrap_or(0);
+        let physics = &self.physics;
+        let ray_probe = |origin: Vec3, dir: Vec3, max_d: f32| {
+            physics
+                .raycast_excluding(origin, dir, max_d, excluded_tag)
+                .map(|(toi, ..)| toi)
+        };
+        if self.player.control_mode == ControlMode::OnFoot && self.ui_state.is_aiming {
+            self.camera.update_over_shoulder(
+                self.player.position,
+                self.player.camera_yaw,
+                self.player.camera_pitch,
+                Some(&ray_probe),
+            );
+            return;
+        }
         let dist = if self.player.control_mode == ControlMode::InVehicle {
             (self.player.camera_distance + 2.5).clamp(4.0, 14.0)
         } else {
             self.player.camera_distance.clamp(2.2, 12.0)
-        };
-        let physics = &self.physics;
-        let ray_probe = |origin: Vec3, dir: Vec3, max_d: f32| {
-            physics.raycast(origin, dir, max_d).map(|(toi, _)| toi)
         };
         self.camera.update_third_person_collided(
             self.player.position,
@@ -410,13 +452,21 @@ impl GameWorldState {
                         self.set_status(txt, (duration_ms as f32 / 1000.0).clamp(2.0, 10.0));
                     }
                 }
+                ScmWorldCommand::DoFade { duration_ms, out } => {
+                    self.fade_target = if out { 1.0 } else { 0.0 };
+                    let secs = (duration_ms.max(50) as f32) / 1000.0;
+                    self.fade_rate = 1.0 / secs;
+                }
+                ScmWorldCommand::DisplayHud(show) => {
+                    self.ui_state.hud_visible_override = Some(show);
+                }
+                ScmWorldCommand::DisplayRadar(show) => {
+                    self.ui_state.radar_visible_override = Some(show);
+                }
                 ScmWorldCommand::CreatePlayer { .. }
                 | ScmWorldCommand::CreateChar { .. }
                 | ScmWorldCommand::CreateCarGenerator { .. }
-                | ScmWorldCommand::DoFade { .. }
                 | ScmWorldCommand::LoadScene(_)
-                | ScmWorldCommand::DisplayHud(_)
-                | ScmWorldCommand::DisplayRadar(_)
                 | ScmWorldCommand::RequestModel(_) => {
                     debug!(?cmd, "Processed SCM boot/script opcode");
                 }
@@ -454,7 +504,14 @@ impl GameWorldState {
         let Some(bytes) = bytes else {
             return;
         };
-        for (name_lower, w, h, rgba, has_alpha) in decode_txd_with_masks(&bytes) {
+        for (name_lower, w, h, mut rgba, mut has_alpha) in decode_txd_with_masks(&bytes) {
+            if txd_lower == "particle"
+                && !has_alpha
+                && (name_lower.starts_with("shad_") || name_lower == "bloodpool_64")
+            {
+                convert_shadow_luminance_to_alpha(&mut rgba);
+                has_alpha = true;
+            }
             let tex_idx =
                 renderer.upload_rgba8_texture(&format!("{txd_lower}/{name_lower}"), w, h, &rgba);
             if has_alpha {
@@ -773,6 +830,8 @@ impl GameWorldState {
         }
         self.marker_mesh =
             Some(renderer.upload_mesh("sa_enex_marker", &CpuMeshData::marker_cone(0.62, 1.15)));
+        self.shadow_quad_mesh =
+            Some(renderer.upload_mesh("sa_shadow_quad", &CpuMeshData::unit_shadow_quad()));
         if self.player_archive.is_some() {
             self.load_cj_from_player_img(renderer);
         }
@@ -783,6 +842,24 @@ impl GameWorldState {
         // Shared vehicle/generic TXDs resolved as fallback & txdp roots
         for shared_txd in ["generic", "particle", "vehicle", "effectspc", "misc"] {
             self.load_single_txd(renderer, shared_txd);
+        }
+        self.water_tex = self.cached_textures.get("particle/waterclear256").copied();
+        self.shad_ped_tex = self.cached_textures.get("particle/shad_ped").copied();
+        self.shad_car_tex = self.cached_textures.get("particle/shad_car").copied();
+
+        // Preload handheld weapon models for equipped weapon rendering
+        for weap_model in [
+            "colt45",
+            "desert_eagle",
+            "chromegun",
+            "mp5lng",
+            "ak47",
+            "m4",
+            "sniper",
+            "bat",
+            "knifecur",
+        ] {
+            self.load_dff_model(renderer, weap_model, weap_model);
         }
 
         // Skinned pedestrian models (`ped.ifp` bone rigs)
@@ -916,9 +993,14 @@ impl GameWorldState {
             } else {
                 None
             };
+            self.cj_right_hand_local = None;
             if !self.cj_parts.is_empty() {
                 if let Some(poses) = &poses {
                     for part in &mut self.cj_parts {
+                        if self.cj_right_hand_local.is_none() {
+                            self.cj_right_hand_local =
+                                compute_bone_world_matrix(&part.rig.frames, BONE_R_HAND, poses);
+                        }
                         if let Some(skin) = &part.rig.skin {
                             let mats = compute_skin_matrices(&part.rig.frames, skin, poses);
                             if !mats.is_empty() {
@@ -950,6 +1032,8 @@ impl GameWorldState {
                     }
                 }
                 if let (Some(poses), Some(skin)) = (&poses, &rig.skin) {
+                    self.cj_right_hand_local =
+                        compute_bone_world_matrix(&rig.frames, BONE_R_HAND, poses);
                     let mats = compute_skin_matrices(&rig.frames, skin, poses);
                     if !mats.is_empty() {
                         for (idx, tpl) in rig.submeshes.iter().enumerate() {
@@ -1149,6 +1233,87 @@ impl GameWorldState {
 
         if changed {
             self.physics.sync_queries();
+        }
+        self.sync_vehicle_colliders();
+    }
+
+    /// Keep dynamic vehicle Rapier3D box colliders synchronized with active exterior vehicles.
+    fn sync_vehicle_colliders(&mut self) {
+        if self.player.interior != 0 {
+            if !self.vehicle_colliders.is_empty() {
+                for (_, h) in self.vehicle_colliders.drain() {
+                    self.physics.remove_collider(h);
+                }
+                self.physics.sync_queries();
+            }
+            return;
+        }
+        let mut active_ids = HashSet::with_capacity(self.vehicles.vehicles.len());
+        let mut topology_changed = false;
+        for veh in &self.vehicles.vehicles {
+            active_ids.insert(veh.id);
+            let half = veh.collider_half_extents();
+            let rot = veh.rotation_quat();
+            let center = veh.position + rot * Vec3::new(0.0, 0.0, half.z);
+            if let Some(&handle) = self.vehicle_colliders.get(&veh.id) {
+                self.physics.update_collider_pose(handle, center, rot);
+            } else {
+                let tag = VEHICLE_COLLIDER_TAG_FLAG | u128::from(veh.id);
+                let handle = self.physics.add_kinematic_box(half, center, rot, tag);
+                self.vehicle_colliders.insert(veh.id, handle);
+                topology_changed = true;
+            }
+        }
+        let stale_ids: Vec<u64> = self
+            .vehicle_colliders
+            .keys()
+            .copied()
+            .filter(|id| !active_ids.contains(id))
+            .collect();
+        for id in stale_ids {
+            if let Some(h) = self.vehicle_colliders.remove(&id) {
+                self.physics.remove_collider(h);
+                topology_changed = true;
+            }
+        }
+        if topology_changed {
+            self.physics.sync_queries();
+        }
+    }
+
+    /// Trigger a San Andreas explosion blast: audio, radial damage to player/peds/vehicles, and visual flash.
+    fn trigger_explosion(&mut self, center: Vec3) {
+        self.audio.play_sfx(SfxCue::Explosion);
+        self.ai
+            .report_crime(CrimeEvent::Explosion, &mut self.player);
+        self.ai.alert_gunshot_near(center, 70.0);
+        self.active_explosions.push((center, 0.45));
+
+        const BLAST_RADIUS: f32 = 14.0;
+        let player_dist = self.player.position.distance(center);
+        if player_dist < BLAST_RADIUS {
+            let falloff = 1.0 - (player_dist / BLAST_RADIUS);
+            self.player.apply_damage(95.0 * falloff);
+        }
+        for ped in &mut self.ai.pedestrians {
+            if ped.health <= 0.0 {
+                continue;
+            }
+            let d = ped.position.distance(center);
+            if d < BLAST_RADIUS {
+                let falloff = 1.0 - (d / BLAST_RADIUS);
+                ped.health = (ped.health - 120.0 * falloff).max(0.0);
+            }
+        }
+        for veh in &mut self.vehicles.vehicles {
+            if veh.exploded {
+                continue;
+            }
+            let d = veh.position.distance(center);
+            if d > 0.5 && d < BLAST_RADIUS {
+                let falloff = 1.0 - (d / BLAST_RADIUS);
+                veh.apply_damage(650.0 * falloff);
+            }
         }
     }
 
@@ -1477,6 +1642,19 @@ impl GameWorldState {
                 self.ui_state.status_message = None;
             }
         }
+        if (self.fade_alpha - self.fade_target).abs() > 1e-4 {
+            let step = (self.fade_rate * dt).max(0.01 * dt * 60.0);
+            if self.fade_alpha < self.fade_target {
+                self.fade_alpha = (self.fade_alpha + step).min(self.fade_target);
+            } else {
+                self.fade_alpha = (self.fade_alpha - step).max(self.fade_target);
+            }
+        }
+        self.ui_state.screen_fade_alpha = self.fade_alpha;
+        for (_, ttl) in &mut self.active_explosions {
+            *ttl -= dt;
+        }
+        self.active_explosions.retain(|(_, ttl)| *ttl > 0.0);
 
         if actions.enter_exit_just_pressed {
             let was_on_foot = self.player.control_mode == ControlMode::OnFoot;
@@ -1497,10 +1675,13 @@ impl GameWorldState {
             self.audio.cycle_radio_next();
         }
 
-        // Fire active weapon on foot
+        self.ui_state.is_aiming =
+            self.player.control_mode == ControlMode::OnFoot && actions.aim_or_reverse;
+
+        // Fire active weapon on foot with occluded 3D raycast against `.col`, vehicles, and peds
         if self.player.control_mode == ControlMode::OnFoot
             && actions.fire_or_attack
-            && let Some((damage, range, _explosive)) = self.player.weapons.try_fire()
+            && let Some((damage, range, explosive)) = self.player.weapons.try_fire()
         {
             let shot_cue = match self.player.weapons.active().map(|w| w.spec.kind) {
                 Some(WeaponKind::Unarmed | WeaponKind::Melee) => SfxCue::Punch,
@@ -1518,20 +1699,65 @@ impl GameWorldState {
                 self.ai
                     .report_crime(CrimeEvent::WeaponDischarged, &mut self.player);
             }
-            let dir = Vec3::new(self.player.yaw.cos(), self.player.yaw.sin(), 0.0).normalize();
-            for ped in &mut self.ai.pedestrians {
-                if ped.health > 0.0 && ped.position.distance(self.player.position) <= range {
-                    let to_ped = (ped.position - self.player.position)
-                        .truncate()
-                        .normalize_or_zero();
-                    if to_ped.dot(dir.truncate()) > 0.75 {
-                        ped.health = (ped.health - damage).max(0.0);
+
+            let (ray_origin, ray_dir) = if self.ui_state.is_aiming {
+                self.camera.aim_ray()
+            } else {
+                let fwd = Vec3::new(self.player.yaw.cos(), self.player.yaw.sin(), 0.0)
+                    .normalize_or_zero();
+                (self.player.position + Vec3::new(0.0, 0.0, 1.32), fwd)
+            };
+
+            let world_hit = self
+                .physics
+                .raycast_excluding(ray_origin, ray_dir, range + 6.0, 0);
+            let mut hit_limit = range;
+            let mut hit_veh_id: Option<u64> = None;
+            if let Some((toi, _n, hit_tag)) = world_hit {
+                let min_self = if self.ui_state.is_aiming { 1.6 } else { 0.35 };
+                if toi >= min_self && toi <= range {
+                    hit_limit = toi;
+                    if (hit_tag & VEHICLE_COLLIDER_TAG_MASK) == VEHICLE_COLLIDER_TAG_FLAG {
+                        hit_veh_id = Some((hit_tag & 0xFFFF_FFFF) as u64);
+                    }
+                    if explosive {
+                        let impact_pos = ray_origin + ray_dir * toi;
+                        self.trigger_explosion(impact_pos);
                     }
                 }
             }
+
+            let mut best_ped: Option<(usize, f32)> = None;
+            for (idx, ped) in self.ai.pedestrians.iter().enumerate() {
+                if ped.health <= 0.0 {
+                    continue;
+                }
+                let ped_center = ped.position + Vec3::new(0.0, 0.0, 0.95);
+                if let Some(t) = ray_hits_sphere(ray_origin, ray_dir, ped_center, 0.65)
+                    && t <= hit_limit + 0.35
+                    && best_ped.is_none_or(|(_, bt)| t < bt)
+                {
+                    best_ped = Some((idx, t));
+                }
+            }
+
+            if let Some((ped_idx, ped_t)) = best_ped
+                && ped_t <= hit_limit + 0.25
+            {
+                let p = &mut self.ai.pedestrians[ped_idx];
+                p.health = (p.health - damage).max(0.0);
+            } else if let Some(vid) = hit_veh_id
+                && let Some(v) = self.vehicles.get_mut(vid)
+            {
+                v.apply_damage(damage * 2.2);
+            }
         }
 
+        let player_water_z = (self.player.interior == 0)
+            .then(|| self.world.water_height_at(self.player.position))
+            .flatten();
         self.player.update_on_foot(dt, actions, &self.physics);
+        self.player.update_water_state(player_water_z, dt);
         if self.player.interior != 0
             && let Some(floor_z) = self.interior_floor_z
             && self.player.position.z < floor_z
@@ -1544,6 +1770,7 @@ impl GameWorldState {
         self.try_handle_interior_service();
         if self.player.control_mode == ControlMode::OnFoot
             && self.player.grounded
+            && !self.player.in_water
             && self.player.velocity.truncate().length() > 1.2
         {
             self.audio.play_sfx(SfxCue::Footstep);
@@ -1554,6 +1781,7 @@ impl GameWorldState {
             self.audio.play_sfx(SfxCue::CarHorn);
         }
         let mut player_crash = false;
+        let mut explosions_to_trigger = Vec::new();
         for veh in &mut self.vehicles.vehicles {
             let ai_action = if Some(veh.id) == occupied_id {
                 None
@@ -1571,7 +1799,14 @@ impl GameWorldState {
                 ai_action.as_ref()
             };
             let prev_hp = veh.health;
-            veh.step_physics(dt, input_for_veh, &self.physics);
+            let ex_tag = Some(VEHICLE_COLLIDER_TAG_FLAG | u128::from(veh.id));
+            let veh_water_z = (self.player.interior == 0)
+                .then(|| self.world.water_height_at(veh.position))
+                .flatten();
+            if veh.step_physics_with_context(dt, input_for_veh, &self.physics, ex_tag, veh_water_z)
+            {
+                explosions_to_trigger.push(veh.position);
+            }
             if Some(veh.id) == occupied_id {
                 if prev_hp - veh.health > 8.0 {
                     player_crash = true;
@@ -1579,6 +1814,9 @@ impl GameWorldState {
                 self.player.position = veh.position;
                 self.player.yaw = veh.yaw;
             }
+        }
+        for exp_pos in explosions_to_trigger {
+            self.trigger_explosion(exp_pos);
         }
         if player_crash {
             self.audio.play_sfx(SfxCue::Crash);
@@ -1826,6 +2064,122 @@ impl GameWorldState {
                     0.0,
                 ));
             }
+
+            // Held 3D weapon DFF attached to CJ's right hand (`BONE_R_HAND`)
+            if let Some(active_w) = self.player.weapons.active()
+                && let Some(dff_key) = weapon_dff_name(&active_w.spec.name)
+                && let Some(weap_model) = self.cached_dff_meshes.get(dff_key)
+            {
+                let cj_world = Mat4::from_rotation_translation(rot, pos);
+                let hand_world = if let Some(local_hand) = self.cj_right_hand_local {
+                    cj_world * local_hand
+                } else {
+                    cj_world * Mat4::from_translation(Vec3::new(0.24, 0.36, 0.28))
+                };
+                let (_s, hand_rot, hand_pos) = hand_world.to_scale_rotation_translation();
+                let weap_rot = hand_rot * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+                for sub in &weap_model.submeshes {
+                    custom_batches
+                        .entry((sub.mesh.0, sub.texture_idx, false, false))
+                        .or_default()
+                        .push(InstanceData::from_transform_lit(
+                            hand_pos,
+                            weap_rot,
+                            Vec3::ONE,
+                            sub.material_color,
+                            1.0,
+                            0.0,
+                        ));
+                }
+            }
+        }
+
+        // Ground-projected entity shadows (`shad_ped` / `shad_car`) & active explosion/fire glow
+        if let Some(quad) = self.shadow_quad_mesh {
+            let ped_shad_tex = self.shad_ped_tex.unwrap_or(renderer.white_tex);
+            let car_shad_tex = self.shad_car_tex.unwrap_or(ped_shad_tex);
+            let mut emit_shadow = |pos: Vec3, scale_xy: Vec3, yaw: f32, tex: usize, alpha: f32| {
+                let ground_z = self
+                    .physics
+                    .ground_height_below(pos.x, pos.y, pos.z + 1.2, 6.0)
+                    .unwrap_or(pos.z);
+                custom_batches
+                    .entry((quad.0, tex, true, true))
+                    .or_default()
+                    .push(InstanceData::from_transform_lit(
+                        Vec3::new(pos.x, pos.y, ground_z + 0.03),
+                        Quat::from_rotation_z(yaw),
+                        scale_xy,
+                        [0.0, 0.0, 0.0, alpha],
+                        2.0,
+                        0.01,
+                    ));
+            };
+
+            if self.player.control_mode == ControlMode::OnFoot && !self.player.in_water {
+                emit_shadow(
+                    self.player.position,
+                    Vec3::new(1.35, 1.35, 1.0),
+                    self.player.yaw,
+                    ped_shad_tex,
+                    0.52,
+                );
+            }
+            if in_exterior {
+                for ped in &self.ai.pedestrians {
+                    if ped.health > 0.0
+                        && ped.position.distance_squared(self.player.position) <= 55.0 * 55.0
+                        && frustum.intersects_sphere(ped.position, 2.0)
+                    {
+                        emit_shadow(
+                            ped.position,
+                            Vec3::new(1.3, 1.3, 1.0),
+                            ped.yaw,
+                            ped_shad_tex,
+                            0.46,
+                        );
+                    }
+                }
+                for v in &self.vehicles.vehicles {
+                    if v.position.distance_squared(self.player.position) <= 90.0 * 90.0
+                        && frustum.intersects_sphere(v.position, 5.0)
+                    {
+                        let ext = v.collider_half_extents();
+                        emit_shadow(
+                            v.position,
+                            Vec3::new(ext.x * 2.25, ext.y * 2.35, 1.0),
+                            v.yaw,
+                            car_shad_tex,
+                            0.58,
+                        );
+                        if !v.exploded && v.health < 250.0 {
+                            let flicker =
+                                ((self.timestep.total_sim_time as f32) * 18.0).sin().abs();
+                            box_instances.push(InstanceData::from_transform_lit(
+                                v.position + v.forward() * 1.15 + Vec3::new(0.0, 0.0, 1.15),
+                                v.rotation_quat(),
+                                Vec3::splat(0.75 + 0.35 * flicker),
+                                [1.0, 0.42 + 0.25 * flicker, 0.08, 0.92],
+                                2.0,
+                                0.0,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        for &(exp_pos, ttl) in &self.active_explosions {
+            let t = (ttl / 0.45).clamp(0.0, 1.0);
+            let scale = 2.5 + (1.0 - t) * 7.5;
+            box_instances.push(InstanceData::from_transform_lit(
+                exp_pos + Vec3::new(0.0, 0.0, 1.2),
+                Quat::from_rotation_z((1.0 - t) * 2.5),
+                Vec3::splat(scale),
+                [1.0, 0.58 * t, 0.12, 0.9],
+                2.0,
+                0.0,
+            ));
         }
 
         if in_exterior {
@@ -2166,15 +2520,34 @@ impl GameWorldState {
         }
 
         if in_exterior && let Some(water) = self.water_mesh {
+            let water_tex = self.water_tex.unwrap_or(renderer.white_tex);
+            let atmo = self
+                .world
+                .atmosphere(self.clock.hours_f32(), self.config.graphics.draw_distance);
+            let tint = if self.water_tex.is_some() {
+                [
+                    (atmo.water_color.x * 0.7 + 0.35).min(1.0),
+                    (atmo.water_color.y * 0.7 + 0.38).min(1.0),
+                    (atmo.water_color.z * 0.7 + 0.42).min(1.0),
+                    0.82,
+                ]
+            } else {
+                [
+                    atmo.water_color.x.max(0.22),
+                    atmo.water_color.y.max(0.45),
+                    atmo.water_color.z.max(0.62),
+                    0.78,
+                ]
+            };
             batches.push(RenderInstanceBatch {
                 mesh: water,
-                texture_idx: renderer.white_tex,
+                texture_idx: water_tex,
                 instances: vec![InstanceData::from_transform_lit(
                     Vec3::ZERO,
                     Quat::IDENTITY,
                     Vec3::ONE,
-                    [1.0, 1.0, 1.0, 1.0],
-                    2.0,
+                    tint,
+                    3.0,
                     0.0,
                 )],
                 transparent: true,
@@ -2286,6 +2659,54 @@ fn ped_model_name_for(model_id: u32) -> &'static str {
         280 => "lapd1",
         9 | 14 => "hmost",
         _ => "fam2",
+    }
+}
+
+fn weapon_dff_name(spec_name: &str) -> Option<&'static str> {
+    match spec_name.to_ascii_lowercase().as_str() {
+        "9mm" | "colt45" => Some("colt45.dff"),
+        "desert_eagle" | "deagle" => Some("desert_eagle.dff"),
+        "shotgun" | "chromegun" => Some("chromegun.dff"),
+        "mp5" | "mp5lng" => Some("mp5lng.dff"),
+        "ak47" => Some("ak47.dff"),
+        "m4" => Some("m4.dff"),
+        "sniper" => Some("sniper.dff"),
+        "bat" => Some("bat.dff"),
+        "knifecur" | "knife" => Some("knifecur.dff"),
+        _ => None,
+    }
+}
+
+fn ray_hits_sphere(origin: Vec3, dir: Vec3, center: Vec3, radius: f32) -> Option<f32> {
+    let oc = origin - center;
+    let b = oc.dot(dir);
+    let c = oc.length_squared() - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = -b - disc.sqrt();
+    if t >= 0.0 {
+        Some(t)
+    } else {
+        let t2 = -b + disc.sqrt();
+        (t2 >= 0.0).then_some(t2)
+    }
+}
+
+fn convert_shadow_luminance_to_alpha(rgba: &mut [u8]) {
+    if rgba.len() < 4 {
+        return;
+    }
+    let bg_lum = (u32::from(rgba[0]) + u32::from(rgba[1]) + u32::from(rgba[2])) / 3;
+    let invert = bg_lum > 128;
+    for px in rgba.as_chunks_mut::<4>().0 {
+        let lum = (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3;
+        let alpha = if invert { 255 - lum } else { lum } as u8;
+        px[0] = 0;
+        px[1] = 0;
+        px[2] = 0;
+        px[3] = alpha;
     }
 }
 
@@ -2585,5 +3006,52 @@ mod tests {
         };
         sim.step_fixed_tick(1.0 / 60.0, &act);
         assert!((sim.player.camera_yaw - init_cam_yaw).abs() > 0.1);
+    }
+
+    #[test]
+    fn vehicle_collider_blocks_weapon_raycast_and_damages_car() {
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        sim.player.weapons.active_slot = 2;
+        let vid = sim.vehicles.vehicles[0].id;
+        sim.player.position = Vec3::new(0.0, 0.0, 0.0);
+        sim.player.yaw = 0.0;
+        sim.vehicles.vehicles[0].position = Vec3::new(8.0, 0.0, 0.0);
+        sim.vehicles.vehicles[0].yaw = 0.0;
+        sim.sync_vehicle_colliders();
+
+        let hp_before = sim.vehicles.get(vid).unwrap().health;
+        let shoot = ActionFrameState {
+            fire_or_attack: true,
+            ..Default::default()
+        };
+        sim.step_fixed_tick(1.0 / 60.0, &shoot);
+        let hp_after = sim.vehicles.get(vid).unwrap().health;
+        assert!(
+            hp_after < hp_before,
+            "shooting vehicle collider should damage vehicle (before={hp_before}, after={hp_after})"
+        );
+    }
+
+    #[test]
+    fn fade_and_hud_scm_commands_drive_ui_state() {
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        sim.scm.world_commands.push(ScmWorldCommand::DoFade {
+            duration_ms: 200,
+            out: true,
+        });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::DisplayHud(false));
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::DisplayRadar(false));
+        sim.drain_scm_world_commands();
+        assert_eq!(sim.ui_state.hud_visible_override, Some(false));
+        assert_eq!(sim.ui_state.radar_visible_override, Some(false));
+
+        for _ in 0..20 {
+            sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        }
+        assert!(sim.ui_state.screen_fade_alpha > 0.8);
     }
 }

@@ -157,10 +157,22 @@ pub struct VehicleEntity {
     /// Current front wheel steering angle in radians.
     #[serde(default)]
     pub steer_angle: f32,
+    #[serde(default)]
+    pub exploded: bool,
     pub params: VehicleParams,
 }
 
 impl VehicleEntity {
+    pub fn collider_half_extents(&self) -> Vec3 {
+        match self.params.class {
+            VehicleClass::Bicycle | VehicleClass::Motorcycle => Vec3::new(0.95, 0.36, 0.55),
+            VehicleClass::Truck | VehicleClass::Bus => Vec3::new(3.2, 1.25, 1.3),
+            VehicleClass::Boat => Vec3::new(2.6, 1.15, 0.8),
+            VehicleClass::Plane | VehicleClass::Helicopter => Vec3::new(3.0, 1.4, 1.2),
+            _ => Vec3::new(2.1, 0.96, 0.74),
+        }
+    }
+
     pub fn rotation_quat(&self) -> Quat {
         Quat::from_euler(glam::EulerRot::ZYX, self.yaw, self.pitch, self.roll)
     }
@@ -187,12 +199,47 @@ impl VehicleEntity {
         actions: Option<&ActionFrameState>,
         physics: &PhysicsWorld,
     ) {
+        let _ = self.step_physics_with_context(dt, actions, physics, None, None);
+    }
+
+    /// Integrate vehicle dynamics with optional collider exclusion tag, water level,
+    /// and burning-to-explosion detection (`health < 250.0` catches fire, returns `true` on detonation).
+    pub fn step_physics_with_context(
+        &mut self,
+        dt: f32,
+        actions: Option<&ActionFrameState>,
+        physics: &PhysicsWorld,
+        excluded_tag: Option<u128>,
+        water_z: Option<f32>,
+    ) -> bool {
+        let mut detonated = false;
+        let in_deep_water = water_z.is_some_and(|wz| self.position.z < wz - 0.65);
+
+        if !self.exploded && self.health < 250.0 && !in_deep_water {
+            self.health = (self.health - 45.0 * dt).max(0.0);
+        }
+        if !self.exploded && self.health <= 0.0 {
+            self.exploded = true;
+            self.engine_on = false;
+            self.lights_on = false;
+            self.siren_on = false;
+            self.velocity.z += 5.5;
+            self.color1 = [0.12, 0.12, 0.12];
+            self.color2 = [0.10, 0.10, 0.10];
+            detonated = true;
+        }
+        if in_deep_water && !matches!(self.params.class, VehicleClass::Boat) {
+            self.engine_on = false;
+        }
+
         let forward = self.forward();
         let right = Vec3::new(forward.y, -forward.x, 0.0);
         let mut forward_speed = self.velocity.dot(forward);
 
         if let Some(act) = actions
-            && self.health > 25.0
+            && !self.exploded
+            && self.health > 0.0
+            && (!in_deep_water || self.params.class == VehicleClass::Boat)
         {
             self.engine_on = true;
             self.horn_active = act.crouch_or_horn;
@@ -289,7 +336,8 @@ impl VehicleEntity {
             self.velocity.z -= 9.81 * dt;
         }
 
-        // Horizontal wall impact detection against `.col` static obstacles
+        // Horizontal wall & vehicle impact detection against colliders (excluding self)
+        let ex_tag = excluded_tag.unwrap_or(0);
         if !matches!(
             self.params.class,
             VehicleClass::Plane | VehicleClass::Helicopter | VehicleClass::Boat
@@ -300,7 +348,8 @@ impl VehicleEntity {
                 let dir = horiz / h_speed;
                 let bumper_origin = self.position + Vec3::new(0.0, 0.0, 0.85);
                 let bumper_dist = 1.6 + h_speed * dt;
-                if let Some((toi, hit_n)) = physics.raycast(bumper_origin, dir, bumper_dist)
+                if let Some((toi, hit_n, _)) =
+                    physics.raycast_excluding(bumper_origin, dir, bumper_dist, ex_tag)
                     && hit_n.z.abs() < 0.5
                 {
                     let horiz_n = Vec3::new(hit_n.x, hit_n.y, 0.0).normalize_or_zero();
@@ -321,8 +370,9 @@ impl VehicleEntity {
         self.position += self.velocity * dt;
 
         if self.params.class == VehicleClass::Boat {
-            if self.position.z < 0.2 {
-                self.position.z = 0.2;
+            let target_z = water_z.unwrap_or(0.0) - 0.15;
+            if self.position.z < target_z {
+                self.position.z = target_z;
                 self.velocity.z = 0.0;
             }
         } else {
@@ -337,9 +387,16 @@ impl VehicleEntity {
                 self.steer_angle *= (1.0 - 8.0 * dt).max(0.0);
             }
 
+            if in_deep_water {
+                // Water drag damps sinking cars smoothly
+                self.velocity *= (1.0 - 2.8 * dt).max(0.0);
+            }
+
             let probe = self.position + Vec3::new(0.0, 0.0, 1.5);
             let probe_dist = 2.5 + (-self.velocity.z * dt).max(0.0);
-            if let Some((toi, _)) = physics.raycast(probe, Vec3::NEG_Z, probe_dist) {
+            if let Some((toi, _, _)) =
+                physics.raycast_excluding(probe, Vec3::NEG_Z, probe_dist, ex_tag)
+            {
                 let ground_z = probe.z - toi;
                 if ground_z <= self.position.z + 0.8
                     && self.position.z <= ground_z + 0.08
@@ -348,7 +405,7 @@ impl VehicleEntity {
                     self.position.z = ground_z;
                     self.velocity.z = 0.0;
                 }
-            } else if self.position.z < 0.0 {
+            } else if self.position.z < 0.0 && water_z.is_none() {
                 self.position.z = 0.0;
                 self.velocity.z = 0.0;
             }
@@ -364,8 +421,8 @@ impl VehicleEntity {
                     let world_off = fwd * local_y + right * local_x;
                     let origin = pos + world_off + Vec3::new(0.0, 0.0, 1.4);
                     physics
-                        .raycast(origin, Vec3::NEG_Z, 2.4)
-                        .map(|(d, _)| origin.z - d)
+                        .raycast_excluding(origin, Vec3::NEG_Z, 2.4, ex_tag)
+                        .map(|(d, _, _)| origin.z - d)
                 };
                 if let (Some(zf), Some(zb)) = (probe_offset(0.0, 1.25), probe_offset(0.0, -1.25)) {
                     let target_pitch = ((zb - zf) / 2.5).atan().clamp(-0.55, 0.55);
@@ -377,6 +434,7 @@ impl VehicleEntity {
                 }
             }
         }
+        detonated
     }
 }
 
@@ -428,6 +486,7 @@ impl VehicleManager {
             occupied_by_player: false,
             wheel_spin: 0.0,
             steer_angle: 0.0,
+            exploded: false,
             params,
         });
         id
@@ -456,6 +515,9 @@ impl VehicleManager {
 
         let mut best: Option<(usize, f32)> = None;
         for (idx, v) in self.vehicles.iter().enumerate() {
+            if v.exploded {
+                continue;
+            }
             let d = v.position.distance(player.position);
             if d <= 4.5 && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((idx, d));
@@ -508,5 +570,31 @@ mod tests {
         let v = mgr.get_mut(vid).unwrap();
         v.step_physics(0.5, Some(&drive), &physics);
         assert!(v.speed_mps() > 2.0);
+    }
+
+    #[test]
+    fn burning_vehicle_below_250_hp_detonates_once() {
+        let physics = PhysicsWorld::new();
+        let mut mgr = VehicleManager::default();
+        let vid = mgr.spawn(VehicleSpawnSpec {
+            model_id: 411,
+            name: "INFERNUS",
+            class: VehicleClass::Car,
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            color1: [0.8, 0.1, 0.1],
+            handling: None,
+        });
+        let v = mgr.get_mut(vid).unwrap();
+        v.apply_damage(800.0); // 200.0 HP left (< 250 catches fire)
+        let mut explosions = 0;
+        for _ in 0..80 {
+            if v.step_physics_with_context(0.1, None, &physics, None, None) {
+                explosions += 1;
+            }
+        }
+        assert_eq!(explosions, 1);
+        assert!(v.exploded);
+        assert_eq!(v.health, 0.0);
     }
 }

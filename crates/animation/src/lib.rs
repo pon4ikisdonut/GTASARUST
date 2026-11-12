@@ -217,16 +217,10 @@ impl AnimationController {
     }
 }
 
-/// Evaluate world-space-to-bind skinning matrices for each bone of a RenderWare `DffSkin`.
-pub fn compute_skin_matrices(
-    frames: &[DffFrame],
-    skin: &DffSkin,
-    poses: &HashMap<i32, BonePose>,
-) -> Vec<Mat4> {
-    if frames.is_empty() || skin.inv_bind_matrices.is_empty() {
-        return Vec::new();
-    }
+/// GTA:SA `eBoneTag::BONE_R_HAND` used for held weapon attachment matrices.
+pub const BONE_R_HAND: i32 = 24;
 
+fn compute_frame_world_matrices(frames: &[DffFrame], poses: &HashMap<i32, BonePose>) -> Vec<Mat4> {
     let locals: Vec<Mat4> = frames
         .iter()
         .enumerate()
@@ -272,6 +266,36 @@ pub fn compute_skin_matrices(
         }
         worlds.push(acc);
     }
+    worlds
+}
+
+/// Evaluate the rig-space world transform of a specific GTA:SA bone (`BONE_R_HAND`, etc.).
+pub fn compute_bone_world_matrix(
+    frames: &[DffFrame],
+    bone_id: i32,
+    poses: &HashMap<i32, BonePose>,
+) -> Option<Mat4> {
+    if frames.is_empty() {
+        return None;
+    }
+    let idx = frames
+        .iter()
+        .position(|f| f.hanim_node_id == Some(bone_id))?;
+    let worlds = compute_frame_world_matrices(frames, poses);
+    worlds.get(idx).copied()
+}
+
+/// Evaluate world-space-to-bind skinning matrices for each bone of a RenderWare `DffSkin`.
+pub fn compute_skin_matrices(
+    frames: &[DffFrame],
+    skin: &DffSkin,
+    poses: &HashMap<i32, BonePose>,
+) -> Vec<Mat4> {
+    if frames.is_empty() || skin.inv_bind_matrices.is_empty() {
+        return Vec::new();
+    }
+
+    let worlds = compute_frame_world_matrices(frames, poses);
 
     let mut frame_by_node_id = HashMap::new();
     for (fi, f) in frames.iter().enumerate() {
@@ -388,5 +412,9 @@ mod tests {
         let mats = compute_skin_matrices(&frames, &skin, &poses);
         assert_eq!(mats.len(), 1);
         assert!((mats[0].w_axis.z - 0.7).abs() < 1e-4);
+
+        let bone_mat =
+            compute_bone_world_matrix(&frames, 5, &poses).expect("bone 5 matrix should exist");
+        assert!((bone_mat.w_axis.z - 0.7).abs() < 1e-4);
     }
 }

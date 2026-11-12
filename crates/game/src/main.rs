@@ -284,7 +284,13 @@ impl WindowedApp {
         };
 
         self.game.camera.aspect = aspect;
-        self.game.camera.fov_radians = self.game.config.graphics.fov_degrees.to_radians();
+        let base_fov = self.game.config.graphics.fov_degrees;
+        let active_fov = if self.game.ui_state.is_aiming {
+            (base_fov * 0.72).clamp(42.0, 56.0)
+        } else {
+            base_fov
+        };
+        self.game.camera.fov_radians = active_fov.to_radians();
         self.game.camera.far = self.game.config.graphics.draw_distance;
 
         let raw_input = egui_winit.take_egui_input(win.as_ref());

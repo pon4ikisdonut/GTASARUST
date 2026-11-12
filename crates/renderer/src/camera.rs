@@ -56,6 +56,45 @@ impl CameraState {
         self.position = look_target + cam_ray_dir * effective_dist;
     }
 
+    /// GTA:SA over-the-shoulder weapon aiming camera: pulls closer, shifts right of CJ's shoulder,
+    /// and projects the aim target along the camera forward axis so shots hit the HUD reticle.
+    pub fn update_over_shoulder(
+        &mut self,
+        target_pos: Vec3,
+        yaw: f32,
+        pitch: f32,
+        ray_hit: Option<&dyn Fn(Vec3, Vec3, f32) -> Option<f32>>,
+    ) {
+        let dir = Vec3::new(
+            yaw.cos() * pitch.cos(),
+            yaw.sin() * pitch.cos(),
+            pitch.sin(),
+        )
+        .normalize();
+        let right = Vec3::new(yaw.sin(), -yaw.cos(), 0.0).normalize();
+        let pivot = target_pos + Vec3::new(0.0, 0.0, 1.52) + right * 0.48;
+        let cam_ray_dir = -dir;
+        let mut back_dist = 2.05_f32;
+        if let Some(probe) = ray_hit
+            && let Some(hit_dist) = probe(pivot, cam_ray_dir, back_dist + 0.3)
+        {
+            back_dist = (hit_dist - 0.3).clamp(0.55, back_dist);
+        }
+        self.position = pivot + cam_ray_dir * back_dist;
+        self.target = pivot + dir * 24.0;
+    }
+
+    /// World-space aim ray `(origin, normalized_direction)` originating from camera through reticle center.
+    pub fn aim_ray(&self) -> (Vec3, Vec3) {
+        let dir = (self.target - self.position).normalize_or_zero();
+        let safe_dir = if dir.length_squared() > 1e-6 {
+            dir
+        } else {
+            Vec3::X
+        };
+        (self.position, safe_dir)
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         glam::camera::rh::view::look_at_mat4(self.position, self.target, Vec3::Z)
     }
@@ -139,5 +178,21 @@ mod tests {
             (dist - 1.65).abs() < 1e-3,
             "Expected collided distance ~1.65, got {dist}"
         );
+    }
+
+    #[test]
+    fn over_shoulder_camera_offsets_right_and_aligns_aim_ray() {
+        let mut cam = CameraState::default();
+        cam.update_over_shoulder(Vec3::new(10.0, 20.0, 1.0), 0.0, 0.0, None);
+        assert!(
+            cam.position.x < 10.0,
+            "camera should sit behind player along -X"
+        );
+        assert!(
+            cam.position.y < 20.0,
+            "camera should shift to right (-Y) shoulder when yaw=0"
+        );
+        let (_, dir) = cam.aim_ray();
+        assert!((dir.x - 1.0).abs() < 1e-4 && dir.y.abs() < 1e-4);
     }
 }

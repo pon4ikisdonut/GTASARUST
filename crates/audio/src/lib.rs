@@ -31,6 +31,7 @@ pub enum SfxCue {
     Punch,
     CarHorn,
     Crash,
+    Explosion,
     RadioClick,
 }
 
@@ -149,6 +150,7 @@ impl AudioEngine {
             SfxCue::Punch,
             SfxCue::CarHorn,
             SfxCue::Crash,
+            SfxCue::Explosion,
             SfxCue::RadioClick,
         ] {
             sfx_clips.insert(cue, synthesize_fallback_sfx(cue));
@@ -258,6 +260,7 @@ impl AudioEngine {
                 (SfxCue::Punch, "GENRL", 136, 15),
                 (SfxCue::CarHorn, "GENRL", 32, 0),
                 (SfxCue::Crash, "GENRL", 131, 2),
+                (SfxCue::Explosion, "GENRL", 45, 0),
                 (SfxCue::RadioClick, "GENRL", 52, 6),
             ];
             for &(cue, pak, bank, snd) in bank_map {
@@ -419,7 +422,7 @@ impl AudioEngine {
                 }
                 self.crash_cooldown = 0.45;
             }
-            SfxCue::RadioClick => {}
+            SfxCue::Explosion | SfxCue::RadioClick => {}
         }
 
         let clip = if cue == SfxCue::Footstep && !self.footstep_variants.is_empty() {
@@ -540,6 +543,7 @@ fn synthesize_fallback_sfx(cue: SfxCue) -> StaticSoundData {
         SfxCue::Punch => 0.09,
         SfxCue::CarHorn => 0.32,
         SfxCue::Crash => 0.18,
+        SfxCue::Explosion => 0.48,
         SfxCue::RadioClick => 0.03,
     };
     let count = (sample_rate as f32 * duration_secs) as usize;
@@ -567,6 +571,9 @@ fn synthesize_fallback_sfx(cue: SfxCue) -> StaticSoundData {
                 (s1 + s2) * 0.25 * (1.0 - (i as f32 / count as f32).powi(4))
             }
             SfxCue::Crash => noise * 0.75 * env,
+            SfxCue::Explosion => {
+                (noise * 0.9 + (t * 48.0 * std::f32::consts::TAU).sin() * 0.65) * env
+            }
             SfxCue::RadioClick => (t * 1400.0 * std::f32::consts::TAU).sin() * 0.25 * env,
         };
         frames.push(Frame::from_mono(sample.clamp(-0.95, 0.95)));

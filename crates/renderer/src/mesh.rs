@@ -311,9 +311,9 @@ impl CpuMeshData {
                 vertices.push(Vertex3D {
                     position: c,
                     normal: [0.0, 0.0, 1.0],
-                    uv: [c[0] / 24.0, c[1] / 24.0],
-                    color: [0.10, 0.42, 0.62, 0.72],
-                    night_color: [0.06, 0.22, 0.36, 0.72],
+                    uv: [c[0] / 8.0, c[1] / 8.0],
+                    color: [0.88, 0.95, 1.0, 0.78],
+                    night_color: [0.45, 0.58, 0.72, 0.78],
                 });
             }
             let p0 = Vec3::from_array(corners[0]);
@@ -379,6 +379,46 @@ impl CpuMeshData {
         }
 
         Self { vertices, indices }
+    }
+
+    /// Build a centered `1x1` ground-projected quad (`Z = 0`, upward `+Z` normal) for entity shadows.
+    pub fn unit_shadow_quad() -> Self {
+        let color = [1.0, 1.0, 1.0, 1.0];
+        let normal = [0.0, 0.0, 1.0];
+        let vertices = vec![
+            Vertex3D {
+                position: [-0.5, -0.5, 0.0],
+                normal,
+                uv: [0.0, 0.0],
+                color,
+                night_color: color,
+            },
+            Vertex3D {
+                position: [0.5, -0.5, 0.0],
+                normal,
+                uv: [1.0, 0.0],
+                color,
+                night_color: color,
+            },
+            Vertex3D {
+                position: [0.5, 0.5, 0.0],
+                normal,
+                uv: [1.0, 1.0],
+                color,
+                night_color: color,
+            },
+            Vertex3D {
+                position: [-0.5, 0.5, 0.0],
+                normal,
+                uv: [0.0, 1.0],
+                color,
+                night_color: color,
+            },
+        ];
+        Self {
+            vertices,
+            indices: vec![0, 1, 2, 0, 2, 3],
+        }
     }
 
     /// Compute minimum vertex Z height (useful for aligning multi-part vehicle meshes to ground).

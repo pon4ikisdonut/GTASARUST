@@ -749,6 +749,60 @@ impl WorldManager {
     }
 }
 
+impl WorldManager {
+    /// Sample exact `water.dat` water surface height at `(pos.x, pos.y)` using 2D triangle barycentrics.
+    pub fn water_height_at(&self, pos: Vec3) -> Option<f32> {
+        let px = pos.x;
+        let py = pos.y;
+        let mut best_z: Option<f32> = None;
+
+        let point_in_tri_z = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| -> Option<f32> {
+            let v0x = b[0] - a[0];
+            let v0y = b[1] - a[1];
+            let v1x = c[0] - a[0];
+            let v1y = c[1] - a[1];
+            let det = v0x * v1y - v1x * v0y;
+            if det.abs() < 1e-5 {
+                return None;
+            }
+            let dx = px - a[0];
+            let dy = py - a[1];
+            let inv_det = 1.0 / det;
+            let u = (dx * v1y - v1x * dy) * inv_det;
+            let v = (v0x * dy - dx * v0y) * inv_det;
+            if u >= -0.001 && v >= -0.001 && (u + v) <= 1.001 {
+                let w = 1.0 - u - v;
+                Some(w * a[2] + u * b[2] + v * c[2])
+            } else {
+                None
+            }
+        };
+
+        for q in &self.water_quads {
+            let c = q.corners;
+            let min_x = c[0][0].min(c[1][0]).min(c[2][0]).min(c[3][0]);
+            let max_x = c[0][0].max(c[1][0]).max(c[2][0]).max(c[3][0]);
+            let min_y = c[0][1].min(c[1][1]).min(c[2][1]).min(c[3][1]);
+            let max_y = c[0][1].max(c[1][1]).max(c[2][1]).max(c[3][1]);
+            if px < min_x || px > max_x || py < min_y || py > max_y {
+                continue;
+            }
+            if let Some(wz) =
+                point_in_tri_z(c[0], c[1], c[3]).or_else(|| point_in_tri_z(c[0], c[3], c[2]))
+            {
+                best_z = Some(best_z.map_or(wz, |prev| prev.max(wz)));
+            }
+        }
+        if best_z.is_none()
+            && self.loaded_from_original_data
+            && (px.abs() > 3000.0 || py.abs() > 3000.0)
+        {
+            return Some(0.0);
+        }
+        best_z
+    }
+}
+
 impl WorldPlacement {
     /// Returns true if this placement is active at integer hour `hour` (handles `tobj` night lamps like `20..6`).
     pub fn is_active_at_hour(&self, hour: u8) -> bool {
@@ -839,5 +893,26 @@ mod tests {
             graph.pick_next_node((15, 1), Some((15, 0)), 42, false),
             Some((15, 2))
         );
+    }
+
+    #[test]
+    fn water_height_at_interpolates_inside_quad_and_none_outside() {
+        let mut world = WorldManager::default();
+        world
+            .water_quads
+            .push(gtasarust_gta_formats::dat::WaterQuad {
+                corners: [
+                    [100.0, 100.0, 2.0],
+                    [200.0, 100.0, 2.0],
+                    [100.0, 200.0, 4.0],
+                    [200.0, 200.0, 4.0],
+                ],
+                flags: 1,
+            });
+        let mid = world
+            .water_height_at(Vec3::new(150.0, 150.0, 5.0))
+            .expect("point inside quad should hit water");
+        assert!((mid - 3.0).abs() < 0.01, "expected z=3.0, got {mid}");
+        assert!(world.water_height_at(Vec3::new(50.0, 50.0, 0.0)).is_none());
     }
 }

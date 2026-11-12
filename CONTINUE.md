@@ -4,10 +4,10 @@
 
 ---
 
-## 1. Current Verified State (Milestone F1+F2 Baseline)
+## 1. Current Verified State (Milestone G1 Baseline)
 
 - **Repository**: `E:\prjects\GTASARUST` (`https://github.com/pon4ikisdonut/GTASARUST.git`, branch `main`)
-- **Last Completed Milestone**: **Milestone F1+F2 — Authentic SA Rendering/Lighting, Modular `player.img` CJ, 4-Wheel Vehicle Rigs, Real `hud.txd`/`LOADSCS.TXD`/`radar00..143` UI & `main.scm` Chunk/Bytecode VM**
+- **Last Completed Milestone**: **Milestone G1 — Water Swimming/Drowning, Vehicle Kinematic Colliders & Fire/Explosions, OTS Aiming & Wall-Occluded Shooting, Ground Shadows & Rich GXT/Fade HUD**
 - **Previous Verified Commits on `main`**:
   - `dd47d1d` — Initial verified 24-crate Rust workspace on Windows + Linux x86_64
   - `7d5e8c9` — **Milestone A**: Textured RenderWare DFF/TXD per-submesh rendering, `DffFrame` hierarchy, alternating tristrip winding parity, vehicle paint tinting, `water.dat` 301-quad mesh, sector asset streaming (`BUG-005` fixed)
@@ -15,25 +15,26 @@
   - `3f5c0f5` — **Milestone C**: All 64 `NODES*.DAT` road/ped path graphs (`68,237` nodes / `143,622` links) driving sidewalk pedestrians, moving ambient road vehicles w/ obstacle yielding, and carjacking crime/panic
   - `3f4a1e0` — **Milestone D**: Real `audio/streams` XOR-unscrambled Ogg Vorbis radio (`264` tracks across `7` stations) & `audio/SFX` 16-bit PCM bank playback (`10` clips from `FEET`/`GENRL`) via `kira 0.12.6`, plus `AGENTS.md` / `CONTINUE.md`
   - `282c342` — **Milestone E**: Full `ANP3` `ped.ifp` decoder (`294` clips), `SkinPLG`/`HAnim` CPU skinning (`fam1`, `1,011` verts deformed), `gta_int.img` binary IPLs (`50,935` placements / `376` `ENEX` portals), safehouse & Cluckin' Bell / Ammu-Nation counters (`BUG-007`, `BUG-008` fixed)
-  - **Milestone F1+F2 (current commit)**:
-    - **Visuals, Lighting & World (`assets/shaders/{world,sky}.wgsl`, `crates/{gta_formats,world,renderer}`)**: Fixed double-sRGB darkening (`Rgba8Unorm` texture upload + full 2x2 mipmap pyramid + sRGB gamma output on `Bgra8Unorm`), `ExtraVertColour` (`0x0253F2F9`) night prelit buffer + `timecyc.dat` ambient/ambient_obj/water/`dn_balance` interpolation, `DXT1` `FORMAT_565` opaque decoding + 8-bit luminance + `merge_rgba_alpha_mask`, `txdp` parent TXD chains across IDEs/`txd.ide`, 3-pass rendering (`world_pipeline`, `world_double_sided_pipeline`, `world_blend_pipeline`), `IDE_FLAG_*` cutout/glass/backface routing, `is_active_at_hour` building schedules, skyline LOD switching outside detail cap, `bounding_radius` frustum culling, omitted fallback ground quad when real map loaded, `water_mesh` rendered in transparent unlit pass
-    - **Player, Camera & Vehicles (`crates/{entities,vehicles,renderer,game}`)**: Decoupled third-person camera orbit (`camera_yaw`/`camera_pitch`/`camera_distance` + mouse wheel zoom + `CursorGrabMode::Locked`/`Confined` pointer lock), `.col` raycast camera anti-clipping (`update_third_person_collided`), camera-relative locomotion & aiming yaw, modular skinned CJ loaded directly from `models/player.img` (`head`, `vest`, `jeans`, `sneaker`, `hands` animated by `ped.ifp`), `CpuMeshData::dff_vehicle_parts` separating vehicle body + `wheel` + 4 `wheel_*_dummy` mounts w/ steering, rolling, left/right flip, and 4-point `.col` pitch/roll alignment
-    - **Retail HUD/Radar & `main.scm` VM (`crates/{gta_formats,scripting,ui,game}`)**: `LOADSCS.TXD` (`loadsc0`) splash screen + `"RESUME FREE ROAM"`, `models/hud.txd` (`69` sprites incl. `fist`, `radardisc`, `radar_north`, `radar_centre`, `radar_sweet`, `radar_cj`), `144` retail `radar00..radar143.txd` minimap & fullscreen textured `Map` view; full `ScmImage` chunk parser (`'s'`, `0..=4`) + 699 SA opcode descriptors (`scm_opcodes.rs`) derived from `D:\gta-reversed` & `ScmVm` multi-thread bytecode execution emitting `ScmWorldCommand` (`SetTimeOfDay`, `ForceWeather`, `CreateCar`, `CreatePickup`, `AddBlip`, `PrintText`, etc.)
-    - Verified across **Windows 10/11 x86_64** (`46` workspace tests pass, `clippy -D warnings`, `--smoke-test`, 6s live Vulkan RX 480 launch: `main_offset=55976`, `hud_sprites=69`, `radar_tiles=144`, `parts=5` CJ, `models=350`, `vehicles=7`, `textures=3008`) and **WSL2 Ubuntu x86_64** (`fmt`, `clippy`, `46` workspace tests pass, release build, headless smoke, `gtasarust-map-inspector`)
+  - `06e45a1` — **Milestone F1+F2**: Fixed double-sRGB darkening & DXT1 565 alpha/txdp chains/3-pass `IDE_FLAG_*` rendering, `ExtraVertColour` day/night prelit buffers + `timecyc.dat` interpolation, modular `player.img` CJ, decoupled orbit camera w/ `.col` anti-clipping, `dff_vehicle_parts` 4-wheel mounts, retail `LOADSCS.TXD`/`hud.txd`/`radar00..143.txd` UI, `ScmImage` chunk parser + `ScmVm` (`699` SA opcodes)
+  - **Milestone G1 (current commit)**:
+    - **Water, Swimming & Vehicle Physics (`crates/{world,entities,vehicles,physics,game}`)**: Exact `water.dat` 2D triangle barycentric height (`WorldManager::water_height_at` + ocean bounds), CJ swimming buoyancy, breath depletion (`breath`), drowning damage & underwater blue HUD bar; dynamic per-vehicle `rapier3d` kinematic box colliders (`VEHICLE_COLLIDER_TAG_FLAG`) w/ self-tag exclusion (`raycast_excluding`), boat buoyancy & deep-water engine stall, `< 250 HP` burning countdown -> single explosion detonation (`SfxCue::Explosion` + `GENRL` 45/0 + charred wreck + blast flash)
+    - **Combat, OTS Camera & Held Weapons (`crates/{renderer,animation,ui,game,audio}`)**: Over-the-shoulder aiming camera (`CameraState::update_over_shoulder` + `aim_ray`) w/ narrowed aiming FOV, `siteM16` reticle & `hud.txd` active weapon icon (`weapon_hud_sprite_name`), preloaded 9 handheld weapon DFFs (`colt45`..`knifecur`) mounted to CJ's right hand bone (`BONE_R_HAND = 24` via `compute_bone_world_matrix`), 3D wall/vehicle/ped-occluded shooting raycasts & explosive blasts
+    - **Shadows, Water Shader & GXT/Fade UI (`assets/shaders/world.wgsl`, `crates/{localization,renderer,ui,game}`)**: `particle.txd` `shad_*`/`bloodpool_64` luminance-to-alpha conversion (`convert_shadow_luminance_to_alpha`), projected `.col` terrain shadows (`shad_ped`/`shad_car`), scrolling animated `waterclear256` shader (`light_params.x > 2.5`), `CHudColours` `~r~/~g~/~b~/~y~/~p~/~w~/~s~/~l~/~h~/~n~` rich-text GXT `LayoutJob` rendering (`parse_sa_rich_text`), and SCM `DoFade`/`DisplayHud`/`DisplayRadar` fullscreen curtain & HUD overrides
+    - Verified across **Windows 10/11 x86_64** (`54/54` workspace tests pass, `clippy -D warnings`, `fmt --check`, `--smoke-test`, 5s live Vulkan RX 480 launch: `colliders=25049 vehicles=8 models=359 textures=3054 backdrop=true hud_sprites=69 radar_tiles=144 sa_sfx_loaded=11`) and **WSL2 Ubuntu x86_64** (`fmt --check`, `clippy -D warnings`, `54/54` workspace tests pass, release `--smoke-test`, `gtasarust-map-inspector`)
 
-- **Open Blockers**: None (`BUG-001`..`BUG-012` resolved in `BUGS.md`).
+- **Open Blockers**: None (`BUG-001`..`BUG-014` resolved in `BUGS.md`).
 
 ---
 
-## 2. Current Next Task — Milestone G: Story Campaign Execution, Cutscenes & Full Gameplay Systems
+## 2. Current Next Task — Milestone G2: Retail `main.scm` + `script.img` Story Execution & Missing Gameplay Systems
 
-1. **Extend `main.scm` Opcode Dispatch & Cutscene / Mission Scripting (`crates/scripting`, `crates/missions`, `crates/game`)**:
-   - Wire additional high-frequency SA script opcodes (actors, vehicles, mission cleanup, garage/shop scripts, camera fades/scripted cams, `LOAD_AND_LAUNCH_MISSION_INTERNAL` streaming into *In the Beginning*, *Big Smoke*, *Ryder*, *Tagging Up Turf*, *Cleaning the Hood* end-to-end).
-   - Add cutscene `.cut`/text playback and synchronized scripted actor paths.
-2. **Deepen Gameplay Systems (`crates/vehicles`, `crates/ai`, `crates/weapons`, `crates/audio`)**:
-   - Motorbike/BMX lean, boat water buoyancy on `water.dat`, helicopter/plane flight lift & rotor spin, weapon aiming reticle (`siteM16`) & ped hit reactions, Pay 'n' Spray / Mod Garages, gang territory wars, and engine/siren audio synthesis.
-3. **Verify & Ship Milestone G**:
-   - Maintain full Windows x86_64 + WSL2 Linux x86_64 parity (`cargo fmt`, `clippy -- -D warnings`, `cargo test`, `--smoke-test`, live Vulkan launch), keep documentation synchronized, and push regularly to `main`.
+1. **Extend `main.scm` & `script.img` Opcode Dispatch (`crates/gta_formats`, `crates/scripting`, `crates/missions`, `crates/game`)**:
+   - Inspect `E:\gtasa\data\script\script.img` and wire external script loading + `LOAD_AND_LAUNCH_MISSION_INTERNAL` (`0x0417`), scripted cameras (`SET_FIXED_CAMERA_POSITION`, `POINT_CAMERA_AT_POINT`, `RESTORE_CAMERA_JUMPCUT`), scripted char/car creation & mission/blip/timer cleanup toward early Los Santos missions (*In the Beginning*, *Big Smoke*, *Ryder*, *Tagging Up Turf*, *Cleaning the Hood*).
+   - Add cutscene `.cut` / timed subtitle & actor choreography support.
+2. **Deepen Vehicle, Combat & Open-World Systems (`crates/vehicles`, `crates/ai`, `crates/weapons`, `crates/audio`)**:
+   - Motorbike/BMX lean, helicopter rotor spin & aircraft lift, Pay 'n' Spray / Mod Garages, gang territory wars, and procedural engine RPM/siren audio.
+3. **Verify & Ship Milestone G2**:
+   - Maintain full Windows x86_64 + WSL2 Linux x86_64 parity (`cargo fmt`, `clippy -- -D warnings`, `cargo test`, `--smoke-test`, live Vulkan launch), keep all 5 docs synchronized, and commit + push to `main`.
 
 ---
 

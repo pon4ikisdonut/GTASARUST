@@ -24,6 +24,10 @@ fn default_camera_distance() -> f32 {
     3.6
 }
 
+fn default_breath() -> f32 {
+    100.0
+}
+
 fn turn_angle_toward(current: f32, target: f32, max_step: f32) -> f32 {
     let diff = (target - current + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
@@ -53,6 +57,8 @@ pub struct PlayerEntity {
     pub armor: f32,
     pub stamina: f32,
     pub max_stamina: f32,
+    #[serde(default = "default_breath")]
+    pub breath: f32,
     pub money: i64,
     pub respect: i32,
     pub wanted_stars: u8,
@@ -84,6 +90,7 @@ impl Default for PlayerEntity {
             armor: 0.0,
             stamina: 100.0,
             max_stamina: 100.0,
+            breath: default_breath(),
             money: 350,
             respect: 0,
             wanted_stars: 0,
@@ -173,7 +180,9 @@ impl PlayerEntity {
             self.anim.transition(AnimState::Jump);
         }
 
-        if !self.grounded {
+        if self.in_water {
+            self.velocity.z *= (1.0 - 4.0 * dt).max(0.0);
+        } else if !self.grounded {
             self.velocity.z -= 18.0 * dt;
         }
 
@@ -243,6 +252,44 @@ impl PlayerEntity {
         }
     }
 
+    /// Update buoyancy, swimming toggle, underwater breath meter, and drowning damage from water level.
+    pub fn update_water_state(&mut self, water_z: Option<f32>, dt: f32) {
+        if self.life_state != PlayerLifeState::Alive || self.control_mode != ControlMode::OnFoot {
+            self.in_water = false;
+            self.breath = (self.breath + 25.0 * dt).min(100.0);
+            return;
+        }
+        let Some(wz) = water_z else {
+            self.in_water = false;
+            self.breath = (self.breath + 25.0 * dt).min(100.0);
+            return;
+        };
+        let depth = wz - self.position.z;
+        if depth > 0.95 {
+            self.in_water = true;
+            self.grounded = false;
+            // Gentle surface buoyancy pulls swimmer toward water surface (~1.1m below chest)
+            let swim_surface_z = wz - 1.05;
+            if self.position.z < swim_surface_z {
+                self.velocity.z = (self.velocity.z + 12.0 * dt).min(2.6);
+            }
+            if depth > 1.55 {
+                self.breath = (self.breath - 10.0 * dt).max(0.0);
+                if self.breath <= 0.0 {
+                    self.apply_damage(16.0 * dt);
+                }
+            } else {
+                self.breath = (self.breath + 20.0 * dt).min(100.0);
+            }
+            self.anim.transition(AnimState::Swim);
+        } else {
+            if depth < 0.55 {
+                self.in_water = false;
+            }
+            self.breath = (self.breath + 25.0 * dt).min(100.0);
+        }
+    }
+
     pub fn apply_damage(&mut self, amount: f32) {
         if self.life_state != PlayerLifeState::Alive || amount <= 0.0 {
             return;
@@ -260,6 +307,8 @@ impl PlayerEntity {
         self.position = pos;
         self.velocity = Vec3::ZERO;
         self.health = self.max_health;
+        self.breath = 100.0;
+        self.in_water = false;
         self.wanted_stars = 0;
         self.money = (self.money - 100).max(0);
         self.control_mode = ControlMode::OnFoot;
@@ -308,5 +357,24 @@ mod tests {
         p.apply_damage(70.0);
         assert_eq!(p.armor, 0.0);
         assert_eq!(p.health, 80.0);
+    }
+
+    #[test]
+    fn player_swims_and_drowns_when_submerged_too_long() {
+        let mut p = PlayerEntity {
+            position: Vec3::new(0.0, 0.0, 1.0),
+            ..Default::default()
+        };
+        p.update_water_state(Some(2.2), 0.1);
+        assert!(p.in_water);
+        assert!(!p.grounded);
+        assert_eq!(p.anim.current, AnimState::Swim);
+
+        p.position = Vec3::new(0.0, 0.0, 0.0);
+        for _ in 0..120 {
+            p.update_water_state(Some(5.0), 0.1);
+        }
+        assert!(p.breath < 1.0);
+        assert!(p.health < 100.0);
     }
 }
