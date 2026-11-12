@@ -419,6 +419,12 @@ impl SceneRenderer {
         height: u32,
         rgba8: &[u8],
     ) -> usize {
+        let needed = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if width == 0 || height == 0 || rgba8.len() < needed {
+            return self.white_tex;
+        }
         let size = wgpu::Extent3d {
             width,
             height,

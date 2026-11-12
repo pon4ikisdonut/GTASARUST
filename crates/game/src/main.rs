@@ -273,6 +273,7 @@ impl WindowedApp {
             return;
         }
 
+        self.game.stream_nearby_render_assets(renderer, 6);
         let atmo = self.game.world.atmosphere(
             self.game.clock.hours_f32(),
             self.game.config.graphics.draw_distance,

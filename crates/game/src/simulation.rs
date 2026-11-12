@@ -4,7 +4,12 @@ use gtasarust_ai::{AiSimulation, CrimeEvent, PedBehavior};
 use gtasarust_audio::AudioEngine;
 use gtasarust_engine::{EngineConfig, FixedTimestep, GameClock, GameDataRoot, HostInfo};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
-use gtasarust_gta_formats::{dat::HandlingCfg, gxt::GxtArchive, img::ImgArchive, rw::DffClump};
+use gtasarust_gta_formats::{
+    dat::HandlingCfg,
+    gxt::GxtArchive,
+    img::ImgArchive,
+    rw::{DffClump, TxdArchive},
+};
 use gtasarust_input::{ActionFrameState, ControlMode, InputManager};
 use gtasarust_localization::LocalizationTable;
 use gtasarust_missions::MissionManager;
@@ -20,6 +25,19 @@ use gtasarust_weapons::WeaponInventory;
 use gtasarust_world::WorldManager;
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
+
+#[derive(Debug, Clone)]
+pub struct CachedSubMesh {
+    pub mesh: GpuMeshHandle,
+    pub texture_idx: usize,
+    pub material_color: [f32; 4],
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedDffModel {
+    pub submeshes: Vec<CachedSubMesh>,
+    pub min_z: f32,
+}
 
 pub struct GameWorldState {
     pub config: EngineConfig,
@@ -39,10 +57,15 @@ pub struct GameWorldState {
     pub camera: CameraState,
     pub ui_state: GameUiState,
     pub quit_requested: bool,
+    pub vfs: Option<GameDataRoot>,
     pub gta3_archive: Option<ImgArchive>,
+    pub gta_int_archive: Option<ImgArchive>,
     pub handling: Option<HandlingCfg>,
-    pub cached_dff_meshes: HashMap<String, GpuMeshHandle>,
+    pub cached_textures: HashMap<String, usize>,
+    pub loaded_txds: HashSet<String>,
+    pub cached_dff_meshes: HashMap<String, CachedDffModel>,
     pub failed_dff_lookups: HashSet<String>,
+    pub water_mesh: Option<GpuMeshHandle>,
 }
 
 impl GameWorldState {
@@ -51,7 +74,9 @@ impl GameWorldState {
             "../../../data/localization/fallback_en.json"
         ));
         let mut gta3_archive = None;
+        let mut gta_int_archive = None;
         let mut handling = None;
+        let mut opened_vfs = None;
 
         let world = if let Some(dir) = &config.game_data_dir {
             match GameDataRoot::open(dir) {
@@ -70,7 +95,12 @@ impl GameWorldState {
                     if let Ok(img_path) = vfs.resolve("models/gta3.img") {
                         gta3_archive = ImgArchive::open(&img_path).ok();
                     }
-                    WorldManager::load_from_game_dir(&vfs, !headless)
+                    if let Ok(img_path) = vfs.resolve("models/gta_int.img") {
+                        gta_int_archive = ImgArchive::open(&img_path).ok();
+                    }
+                    let loaded_world = WorldManager::load_from_game_dir(&vfs, !headless);
+                    opened_vfs = Some(vfs);
+                    loaded_world
                 }
                 Err(err) => {
                     warn!("Could not open game directory ({err}); using fallback world slice");
@@ -159,47 +189,231 @@ impl GameWorldState {
             camera,
             ui_state: GameUiState::default(),
             quit_requested: false,
+            vfs: opened_vfs,
             gta3_archive,
+            gta_int_archive,
             handling,
+            cached_textures: HashMap::new(),
+            loaded_txds: HashSet::new(),
             cached_dff_meshes: HashMap::new(),
             failed_dff_lookups: HashSet::new(),
+            water_mesh: None,
         }
     }
 
-    pub fn preload_render_meshes(&mut self, renderer: &mut SceneRenderer) {
-        // Preload a small set of local Grove Street models if original gta3.img is present
-        let Some(img) = &self.gta3_archive else {
+    fn read_archive_entry(&self, entry_name: &str) -> Option<Vec<u8>> {
+        if let Some(img) = &self.gta3_archive
+            && let Ok(bytes) = img.read_entry(entry_name)
+        {
+            return Some(bytes);
+        }
+        if let Some(img) = &self.gta_int_archive
+            && let Ok(bytes) = img.read_entry(entry_name)
+        {
+            return Some(bytes);
+        }
+        None
+    }
+
+    fn ensure_txd_loaded(&mut self, renderer: &mut SceneRenderer, txd_name: &str) {
+        let txd_lower = txd_name.trim().to_ascii_lowercase();
+        if txd_lower.is_empty() || !self.loaded_txds.insert(txd_lower.clone()) {
+            return;
+        }
+        let txd_entry = format!("{txd_lower}.txd");
+        let bytes = self.read_archive_entry(&txd_entry).or_else(|| {
+            self.vfs.as_ref().and_then(|v| {
+                v.read_bytes(&format!("models/generic/{txd_entry}"))
+                    .or_else(|_| v.read_bytes(&format!("models/{txd_entry}")))
+                    .ok()
+            })
+        });
+        let Some(bytes) = bytes else {
             return;
         };
-        let mut loaded = 0usize;
+        let Ok(archive) = TxdArchive::parse(&bytes) else {
+            return;
+        };
+        for tex in archive.textures {
+            let tex_idx = renderer.upload_rgba8_texture(
+                &format!("{txd_lower}/{}", tex.name),
+                tex.width,
+                tex.height,
+                &tex.rgba8,
+            );
+            let tex_lower = tex.name.to_ascii_lowercase();
+            self.cached_textures
+                .insert(format!("{txd_lower}/{tex_lower}"), tex_idx);
+            self.cached_textures.entry(tex_lower).or_insert(tex_idx);
+        }
+    }
+
+    fn resolve_texture_idx(
+        &self,
+        txd_lower: &str,
+        tex_name: Option<&str>,
+        fallback: usize,
+    ) -> usize {
+        let Some(raw) = tex_name else {
+            return fallback;
+        };
+        let tex_lower = raw.to_ascii_lowercase();
+        if !txd_lower.is_empty()
+            && let Some(&idx) = self
+                .cached_textures
+                .get(&format!("{txd_lower}/{tex_lower}"))
+        {
+            return idx;
+        }
+        self.cached_textures
+            .get(&tex_lower)
+            .copied()
+            .unwrap_or(fallback)
+    }
+
+    fn load_dff_model(
+        &mut self,
+        renderer: &mut SceneRenderer,
+        model_lower: &str,
+        txd_lower: &str,
+    ) -> bool {
+        let dff_name = format!("{model_lower}.dff");
+        if self.cached_dff_meshes.contains_key(&dff_name)
+            || self.failed_dff_lookups.contains(&dff_name)
+        {
+            return false;
+        }
+        if !txd_lower.is_empty() {
+            self.ensure_txd_loaded(renderer, txd_lower);
+        }
+        let Some(bytes) = self.read_archive_entry(&dff_name) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let Ok(clump) = DffClump::parse(&bytes) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let subs = CpuMeshData::dff_clump_submeshes(&clump);
+        if subs.is_empty() {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        }
+
+        let mut min_z = f32::INFINITY;
+        let mut cached_subs = Vec::with_capacity(subs.len());
+        for (idx, sub) in subs.into_iter().enumerate() {
+            min_z = min_z.min(sub.cpu_mesh.min_z());
+            let tex_idx = self.resolve_texture_idx(
+                txd_lower,
+                sub.texture_name.as_deref(),
+                renderer.white_tex,
+            );
+            let handle = renderer.upload_mesh(&format!("{dff_name}#{idx}"), &sub.cpu_mesh);
+            cached_subs.push(CachedSubMesh {
+                mesh: handle,
+                texture_idx: tex_idx,
+                material_color: sub.material_color,
+            });
+        }
+        if !min_z.is_finite() {
+            min_z = 0.0;
+        }
+        self.cached_dff_meshes.insert(
+            dff_name,
+            CachedDffModel {
+                submeshes: cached_subs,
+                min_z,
+            },
+        );
+        true
+    }
+
+    pub fn preload_render_meshes(&mut self, renderer: &mut SceneRenderer) {
+        if let Some(water_cpu) = CpuMeshData::from_water_quads(&self.world.water_quads) {
+            self.water_mesh = Some(renderer.upload_mesh("sa_water_quads", &water_cpu));
+        }
+        if self.gta3_archive.is_none() && self.gta_int_archive.is_none() {
+            return;
+        }
+
+        // Shared vehicle/generic TXDs resolved as parent fallback textures
+        for shared_txd in ["vehicle", "misc", "particle"] {
+            self.ensure_txd_loaded(renderer, shared_txd);
+        }
+
+        // Preload starter vehicles (`GREENWOO`, `BMX`, `INFERNUS`, `COPCARLA`)
+        let vehicle_specs: Vec<(String, String)> = self
+            .vehicles
+            .vehicles
+            .iter()
+            .map(|v| {
+                let def = self.world.vehicles.get(&v.model_id);
+                let model = def
+                    .map(|d| d.model_name.to_ascii_lowercase())
+                    .unwrap_or_else(|| v.name.to_ascii_lowercase());
+                let txd = def
+                    .map(|d| d.txd_name.to_ascii_lowercase())
+                    .unwrap_or_else(|| model.clone());
+                (model, txd)
+            })
+            .chain(std::iter::once((
+                "copcarla".to_string(),
+                "copcarla".to_string(),
+            )))
+            .collect();
+        for (model, txd) in vehicle_specs {
+            self.load_dff_model(renderer, &model, &txd);
+        }
+
         self.world
             .update_streaming(self.player.position, self.config.graphics.draw_distance);
-        let names: Vec<String> = self
-            .world
-            .active_placements(0)
-            .filter(|p| !p.is_lod)
-            .take(32)
-            .map(|p| format!("{}.dff", p.model_name.to_ascii_lowercase()))
-            .collect();
+        let initial_loaded = self.stream_nearby_render_assets(renderer, 64);
+        if initial_loaded > 0 || !self.cached_dff_meshes.is_empty() {
+            info!(
+                models = self.cached_dff_meshes.len(),
+                textures = self.cached_textures.len(),
+                "Preloaded textured RenderWare DFF/TXD assets"
+            );
+        }
+    }
 
-        for dff_name in names {
-            if self.cached_dff_meshes.contains_key(&dff_name) {
+    /// Incrementally upload nearby streamed world placements & vehicle models within a per-frame budget.
+    pub fn stream_nearby_render_assets(
+        &mut self,
+        renderer: &mut SceneRenderer,
+        budget: usize,
+    ) -> usize {
+        if self.gta3_archive.is_none() && self.gta_int_archive.is_none() {
+            return 0;
+        }
+        let mut pending: Vec<(f32, String, String)> = Vec::new();
+        for p in self.world.active_placements(self.player.interior_zero()) {
+            if p.is_lod {
                 continue;
             }
-            if let Ok(bytes) = img.read_entry(&dff_name)
-                && let Ok(clump) = DffClump::parse(&bytes)
-                && let Some(cpu) = CpuMeshData::from_dff_clump(&clump)
+            let model_lower = p.model_name.to_ascii_lowercase();
+            let dff_name = format!("{model_lower}.dff");
+            if self.cached_dff_meshes.contains_key(&dff_name)
+                || self.failed_dff_lookups.contains(&dff_name)
             {
-                let handle = renderer.upload_mesh(&dff_name, &cpu);
-                self.cached_dff_meshes.insert(dff_name, handle);
+                continue;
+            }
+            let dist = p.position.distance_squared(self.player.position);
+            pending.push((dist, model_lower, p.txd_name.to_ascii_lowercase()));
+        }
+        pending.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        let mut loaded = 0usize;
+        for (_, model_lower, txd_lower) in pending {
+            if loaded >= budget {
+                break;
+            }
+            if self.load_dff_model(renderer, &model_lower, &txd_lower) {
                 loaded += 1;
-            } else {
-                self.failed_dff_lookups.insert(dff_name);
             }
         }
-        if loaded > 0 {
-            info!(loaded, "Preloaded RenderWare DFF meshes from gta3.img");
-        }
+        loaded
     }
 
     pub fn step_frame(&mut self, frame_dt: f32) {
@@ -446,14 +660,20 @@ impl GameWorldState {
 
     pub fn collect_render_batches(&self, renderer: &SceneRenderer) -> Vec<RenderInstanceBatch> {
         let frustum = self.camera.frustum();
+        let ground_z = if self.world.loaded_from_original_data {
+            -0.08
+        } else {
+            0.0
+        };
         let ground_instances = vec![InstanceData::from_transform(
-            Vec3::new(self.player.position.x, self.player.position.y, 0.0),
+            Vec3::new(self.player.position.x, self.player.position.y, ground_z),
             Quat::IDENTITY,
             Vec3::ONE,
             [0.85, 0.88, 0.80, 1.0],
         )];
 
         let mut box_instances = Vec::new();
+        let mut custom_batches: HashMap<(usize, usize), Vec<InstanceData>> = HashMap::new();
 
         // Player character (CJ) when on foot
         if self.player.control_mode == ControlMode::OnFoot {
@@ -465,9 +685,25 @@ impl GameWorldState {
             ));
         }
 
-        // Vehicles
+        // Vehicles (use real RenderWare DFF+TXD submeshes when available, fallback to colored bounds)
         for v in &self.vehicles.vehicles {
-            if frustum.intersects_sphere(v.position, 5.0) {
+            if !frustum.intersects_sphere(v.position, 6.0) {
+                continue;
+            }
+            let dff_key = format!("{}.dff", v.name.to_ascii_lowercase());
+            if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
+                let z_lift = (-model.min_z).clamp(0.0, 1.5);
+                let pos = v.position + Vec3::new(0.0, 0.0, z_lift);
+                // Match RenderWare GTA:SA forward-axis (+Y) orientation cleanly to yaw rotation
+                let rot = v.rotation_quat() * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+                for sub in &model.submeshes {
+                    let tint = apply_vehicle_paint_tint(sub.material_color, v.color1, v.color2);
+                    custom_batches
+                        .entry((sub.mesh.0, sub.texture_idx))
+                        .or_default()
+                        .push(InstanceData::from_transform(pos, rot, Vec3::ONE, tint));
+                }
+            } else {
                 let scale = match v.params.class {
                     VehicleClass::Bicycle | VehicleClass::Motorcycle => Vec3::new(1.8, 0.7, 1.1),
                     VehicleClass::Truck | VehicleClass::Bus => Vec3::new(6.8, 2.5, 2.8),
@@ -521,28 +757,28 @@ impl GameWorldState {
             ));
         }
 
-        // World streamed objects (actual RenderWare DFF meshes when preloaded, or bounding blocks)
-        let mut custom_batches: HashMap<usize, Vec<InstanceData>> = HashMap::new();
+        // World streamed objects (actual textured RenderWare DFF submeshes when loaded, or fallback blocks)
         for p in self.world.active_placements(self.player.interior_zero()) {
             if p.is_lod {
                 continue;
             }
-            if !frustum.intersects_sphere(p.position, 40.0) {
+            if !frustum.intersects_sphere(p.position, 55.0) {
                 continue;
             }
             let dff_key = format!("{}.dff", p.model_name.to_ascii_lowercase());
-            if let Some(handle) = self.cached_dff_meshes.get(&dff_key) {
-                custom_batches
-                    .entry(handle.0)
-                    .or_default()
-                    .push(InstanceData::from_transform(
-                        p.position,
-                        p.rotation,
-                        Vec3::ONE,
-                        [1.0, 1.0, 1.0, 1.0],
-                    ));
+            if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
+                for sub in &model.submeshes {
+                    custom_batches
+                        .entry((sub.mesh.0, sub.texture_idx))
+                        .or_default()
+                        .push(InstanceData::from_transform(
+                            p.position,
+                            p.rotation,
+                            Vec3::ONE,
+                            sub.material_color,
+                        ));
+                }
             } else if !self.world.loaded_from_original_data {
-                // Representative Grove Street / city buildings when running in fallback slice
                 box_instances.push(InstanceData::from_transform(
                     p.position + Vec3::new(0.0, 0.0, 6.0),
                     p.rotation,
@@ -565,10 +801,23 @@ impl GameWorldState {
             },
         ];
 
-        for (mesh_idx, instances) in custom_batches {
+        if let Some(water) = self.water_mesh {
+            batches.push(RenderInstanceBatch {
+                mesh: water,
+                texture_idx: renderer.white_tex,
+                instances: vec![InstanceData::from_transform(
+                    Vec3::ZERO,
+                    Quat::IDENTITY,
+                    Vec3::ONE,
+                    [1.0, 1.0, 1.0, 1.0],
+                )],
+            });
+        }
+
+        for ((mesh_idx, tex_idx), instances) in custom_batches {
             batches.push(RenderInstanceBatch {
                 mesh: GpuMeshHandle(mesh_idx),
-                texture_idx: renderer.white_tex,
+                texture_idx: tex_idx,
                 instances,
             });
         }
@@ -614,5 +863,16 @@ trait PlayerInteriorExt {
 impl PlayerInteriorExt for PlayerEntity {
     fn interior_zero(&self) -> i32 {
         0
+    }
+}
+
+fn apply_vehicle_paint_tint(mat_col: [f32; 4], color1: [f32; 3], color2: [f32; 3]) -> [f32; 4] {
+    // GTA:SA RenderWare reserves RGB ~(60, 255, 0) for primary paint and ~(255, 0, 175) for secondary.
+    if (mat_col[0] - 60.0 / 255.0).abs() < 0.08 && mat_col[1] > 0.90 && mat_col[2] < 0.08 {
+        [color1[0], color1[1], color1[2], mat_col[3]]
+    } else if mat_col[0] > 0.90 && mat_col[1] < 0.08 && (mat_col[2] - 175.0 / 255.0).abs() < 0.08 {
+        [color2[0], color2[1], color2[2], mat_col[3]]
+    } else {
+        mat_col
     }
 }

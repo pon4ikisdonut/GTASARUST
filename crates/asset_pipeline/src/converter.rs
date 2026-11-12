@@ -74,8 +74,12 @@ pub fn clump_to_converted_mesh(name: &str, clump: &DffClump, source_bytes: &[u8]
         if !geom.splits.is_empty() {
             for split in &geom.splits {
                 if geom.is_tristrip {
-                    for win in split.indices.windows(3) {
-                        let (a, b, c) = (win[0], win[1], win[2]);
+                    for (step, win) in split.indices.windows(3).enumerate() {
+                        let (a, b, c) = if step % 2 == 1 {
+                            (win[0], win[2], win[1])
+                        } else {
+                            (win[0], win[1], win[2])
+                        };
                         if a != b && b != c && a != c {
                             indices.push(base_vertex + a);
                             indices.push(base_vertex + b);

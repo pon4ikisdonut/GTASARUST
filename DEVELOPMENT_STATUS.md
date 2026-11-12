@@ -14,7 +14,7 @@ Status Legend:
 | Phase 1 | Foundation | Tested | 24-crate Cargo workspace, `x86_64`-only enforcement, TOML config, tracing logging, case-insensitive VFS, CI |
 | Phase 2 | Engine | Tested | `winit` windowing, `wgpu` 3D renderer + frustum culling + `egui` HUD/menus, `rapier3d` physics, `kira` audio, `gilrs`/KB input |
 | Phase 3 | Original Asset Pipeline | Tested | Parsers for `VER2` IMG (8 archives), DFF (`0x34003`/`0x36003`), TXD, COL1-4, IDE, text & binary `bnry` IPL, `TABL`/`TKEY`/`TDAT` GXT, DAT, IFP, SCM header + CLI tools |
-| Phase 4 | World | In progress | `gta.dat`/`default.dat` loader (14,344 IDE objs, 1,455 sectors, 45,837 placements w/ binary IPLs, 384 zones, 301 water quads) + runtime DFF preloading |
+| Phase 4 | World | In progress | `gta.dat`/`default.dat` loader (14,344 IDE objs, 1,455 sectors, 45,837 placements w/ binary IPLs, 384 zones, 301 `water.dat` quads), textured DFF/TXD per-submesh rendering, `water.dat` mesh, dynamic nearby sector streaming |
 | Phase 5 | Player | In progress | On-foot controller (walk/sprint/jump/crouch/health/armor), hospital respawn, third-person camera |
 | Phase 6 | Vehicles | In progress | Vehicle manager, `handling.cfg` (210 entries), enter/exit state switching, basic driving physics |
 | Phase 7 | World Simulation | In progress | Pedestrians, 6-star wanted escalation & cop spawning, 24h game clock & timecycle sky interpolation |
@@ -31,7 +31,7 @@ Status Legend:
 | `gtasarust-engine` | Platform paths, config, logging, lifecycle | Tested | 6 unit tests pass; VFS resolves `E:\gtasa` mixed-case paths |
 | `gtasarust-gta-formats` | Clean-room SA binary/text parsers | Tested | 5 unit tests pass; inspected 15,334 DFF, 3,983 TXD, 257 COL, 16,588 GXT on `E:\gtasa` |
 | `gtasarust-asset-pipeline` | Batch extraction, conversion, manifests | Tested | Unit test + `assets_suite` pass; converted DFF meshes to JSON/manifest cleanly |
-| `gtasarust-renderer` | `wgpu` + WGSL 3D renderer & timecycle | Tested | Unit test passes; initialized Vulkan surface on Radeon RX 480 & preloaded 21 DFF meshes |
+| `gtasarust-renderer` | `wgpu` + WGSL 3D renderer & timecycle | Tested | 3 unit tests pass; initialized Vulkan surface on Radeon RX 480; preloaded 68 DFF models / 629 TXD textures + `water.dat` mesh |
 | `gtasarust-physics` | `rapier3d` world/character/vehicle physics | Tested | Unit test (`ground_raycast_hits_z_zero`) + integration suite pass |
 | `gtasarust-audio` | `kira` mixer, SFX, radio playback | Tested | Headless radio test passes; live `Kira` audio backend initialized on Windows |
 | `gtasarust-input` | `winit` + `gilrs` input mapping | Tested | Compiles cleanly; `gilrs` initialized at runtime on Windows |
@@ -50,6 +50,6 @@ Status Legend:
 | `gtasarust-tools` | CLI tools (`extract`, `convert`, `map`, `viewer`) | Tested | All 4 CLI binaries verified on `E:\gtasa` (`gta3.img`, `infernus.dff`, `hud.txd`) |
 
 ## Next Immediate Task
-1. Commit and push verified Windows `x86_64-pc-windows-msvc` workspace to GitHub and trigger GitHub Actions CI for Linux `x86_64-unknown-linux-gnu` verification.
-2. Verify `x86_64-unknown-linux-gnu` compilation/testing via CI and local WSL2 (`Ubuntu-22.04`).
-3. Advance Phase 4 (render textured DFF materials/TXD textures per surface, load COL collision geometry into `PhysicsWorld`, render real `water.dat` quads).
+1. Load `.col` collision archives (`models/coll/*.col` + `gta3.img`) into `PhysicsWorld` (`rapier3d` static colliders) for active sectors and ground-raycast starter spawns at real Grove Street terrain `Z` (`BUG-006`).
+2. Fix binary IPL `bnry` `cars_offset` parsing and spawn parked vehicles from IPL car generators (`BUG-004`).
+3. Expand Phase 7–9 (`NODES*.DAT` traffic/ped paths, `audio/streams` + SFX decoding, `ped.ifp` animation playback, `main.scm` opcodes).

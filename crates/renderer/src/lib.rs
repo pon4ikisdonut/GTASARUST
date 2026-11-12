@@ -7,5 +7,5 @@ pub mod mesh;
 pub mod renderer;
 
 pub use camera::{CameraState, Frustum};
-pub use mesh::{GpuMeshHandle, InstanceData, Vertex3D};
+pub use mesh::{CpuMeshData, DffSubMesh, GpuMeshHandle, InstanceData, Vertex3D};
 pub use renderer::{RenderInstanceBatch, SceneRenderer};

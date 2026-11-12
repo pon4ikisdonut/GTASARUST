@@ -5,8 +5,8 @@ Tracks feature parity between the original *Grand Theft Auto: San Andreas* (PC v
 | Category | Original Feature | GTASARUST Status | Crate / Module |
 | --- | --- | --- | --- |
 | **Assets & Formats** | IMG v2 (`gta3.img`, `gta_int.img`, `player.img`, `cutscene.img`) | Tested (`E:\gtasa`, 8 archives) | `gtasarust-gta-formats` |
-| **Assets & Formats** | DFF RenderWare Clump / Geometry / FrameList / Materials | Tested (15,334 DFFs indexed, `infernus.dff` + 21 Grove meshes loaded) | `gtasarust-gta-formats` |
-| **Assets & Formats** | TXD RenderWare TextureDictionary (DXT1/3/5, RGBA, Palettized) | Tested (`hud.txd` 69 textures decoded; 3,983 archives indexed) | `gtasarust-gta-formats` |
+| **Assets & Formats** | DFF RenderWare Clump / Geometry / FrameList / Materials | Tested (15,334 DFFs indexed; textured `DffSubMesh` + frame hierarchy rendered) | `gtasarust-gta-formats`, `gtasarust-renderer` |
+| **Assets & Formats** | TXD RenderWare TextureDictionary (DXT1/3/5, RGBA, Palettized) | Tested (3,983 archives indexed; runtime TXD texture streaming uploaded `629` textures) | `gtasarust-gta-formats`, `gtasarust-renderer` |
 | **Assets & Formats** | COL1 / COL2 / COL3 / COL4 collision archives | Tested (257 COL entries indexed; physics attachment pending) | `gtasarust-gta-formats` |
 | **Assets & Formats** | IDE object/vehicle/ped definitions & text/binary IPL placements | Tested (14,344 objects, 45,837 placements loaded) | `gtasarust-gta-formats` |
 | **Assets & Formats** | GXT localization tables (`american.gxt`, etc.) | Tested (16,588 entries parsed & queried) | `gtasarust-gta-formats`, `gtasarust-localization` |
@@ -16,7 +16,7 @@ Tracks feature parity between the original *Grand Theft Auto: San Andreas* (PC v
 | **Engine & Graphics** | `wgpu` 3D renderer, perspective camera, directional sun, fog | Tested (Vulkan RX 480 window & sky/ground/instanced DFF pass) | `gtasarust-renderer` |
 | **Engine & Graphics** | Timecycle sky/clouds/day-night/weather transitions | In progress (shader & timecycle interpolation wired) | `gtasarust-renderer`, `gtasarust-world` |
 | **Engine & Graphics** | LOD system, frustum culling, GPU instancing, sector streaming | In progress (frustum culling + instancing + sector grid active) | `gtasarust-renderer`, `gtasarust-world` |
-| **Engine & Graphics** | Water rendering & reflections | Planned (`water.dat` parsed; GPU water mesh pending) | `gtasarust-renderer`, `gtasarust-world` |
+| **Engine & Graphics** | Water rendering & reflections | In progress (`301` `water.dat` quads uploaded and rendered via GPU mesh; reflections/buoyancy pending) | `gtasarust-renderer`, `gtasarust-world` |
 | **World** | Los Santos, San Fierro, Las Venturas, Countryside & Desert | In progress (placements & zones loaded across full map) | `gtasarust-world` |
 | **World** | Road/ped path nodes (`NODES*.DAT`), interiors, railways | Planned | `gtasarust-world` |
 | **Player** | Third-person movement (walk/run/sprint/jump/crouch/swim/climb) | In progress (walk/sprint/jump/crouch physics & camera implemented) | `gtasarust-entities`, `gtasarust-animation` |
