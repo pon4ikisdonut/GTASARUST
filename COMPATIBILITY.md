@@ -7,7 +7,7 @@ GTASARUST targets **x86_64 / AMD64 ONLY**. 32-bit architectures are unsupported.
 | Platform | Target Triple | Build Status | Runtime Test Status | Notes |
 | --- | --- | --- | --- | --- |
 | Windows 10/11 x64 | `x86_64-pc-windows-msvc` | Passing (Release & Debug) | Passing (`cargo test --workspace`, headless smoke test, 4s Vulkan RX 480 windowed launch) | Primary host development environment (`E:\gtasa` v1.00 tested) |
-| Ubuntu 22.04+ x86_64 | `x86_64-unknown-linux-gnu` | Pending CI/WSL build | Pending | Verified via GitHub Actions & local WSL2 |
+| Ubuntu 22.04+ x86_64 | `x86_64-unknown-linux-gnu` | Passing (Release, Clippy `-D warnings`) | Passing (native WSL2 Ubuntu 22.04.5 LTS: `cargo test --workspace`, headless smoke test + `map-inspector` against `/mnt/e/gtasa`) | Verified native Linux binary, ALSA/udev/X11/Wayland linkage & case-insensitive VFS |
 | Debian x86_64 | `x86_64-unknown-linux-gnu` | Pending | Pending | Uses standard glibc + Vulkan/X11/Wayland |
 | Fedora x86_64 | `x86_64-unknown-linux-gnu` | Pending | Pending | Uses standard glibc + Vulkan/X11/Wayland |
 | Arch Linux x86_64 | `x86_64-unknown-linux-gnu` | Pending | Pending | Uses standard glibc + Vulkan/X11/Wayland |

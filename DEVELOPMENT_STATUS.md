@@ -21,7 +21,7 @@ Status Legend:
 | Phase 8 | Gameplay | In progress | Weapon inventory & fire/reload cooldowns, save slot serialization w/ SHA-256 integrity checks |
 | Phase 9 | Story | In progress | Campaign mission framework & early SCM VM scaffolding (bytecode execution expansion pending) |
 | Phase 10 | Final Game | In progress | Main menu, pause menu, SA HUD/minimap stub, settings menu, localization w/ GXT + fallback JSON |
-| Phase 11 | Compatibility | In progress | Verified on Windows 10/11 `x86_64-pc-windows-msvc` (DX12/Vulkan RX 480); Linux `x86_64-unknown-linux-gnu` CI & WSL2 pending |
+| Phase 11 | Compatibility | Tested | Verified native builds & runtime checks on both Windows 10/11 (`x86_64-pc-windows-msvc`) and Ubuntu 22.04.5 LTS (`x86_64-unknown-linux-gnu` via WSL2) against `E:\gtasa` |
 | Phase 12 | Release | Not started | Release packaging & final documentation |
 
 ## Subsystem Matrix
