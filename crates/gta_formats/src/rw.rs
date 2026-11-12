@@ -15,6 +15,8 @@ pub const RW_ATOMIC: u32 = 0x0014;
 pub const RW_TEXTURE_NATIVE: u32 = 0x0015;
 pub const RW_TEX_DICTIONARY: u32 = 0x0016;
 pub const RW_GEOMETRY_LIST: u32 = 0x001A;
+pub const RW_SKIN_PLG: u32 = 0x0116;
+pub const RW_HANIM_PLG: u32 = 0x011E;
 pub const RW_BIN_MESH_PLG: u32 = 0x050E;
 
 #[derive(Debug, Clone, Copy)]
@@ -47,12 +49,31 @@ impl RwChunkHeader {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DffHAnimNode {
+    pub node_id: i32,
+    pub node_index: i32,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DffFrame {
     pub rotation: [[f32; 3]; 3],
     pub position: [f32; 3],
     pub parent: i32,
     pub flags: u32,
     pub name: String,
+    #[serde(default)]
+    pub hanim_node_id: Option<i32>,
+    #[serde(default)]
+    pub hanim_nodes: Vec<DffHAnimNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DffSkin {
+    pub num_bones: u8,
+    pub bone_indices: Vec<[u8; 4]>,
+    pub bone_weights: Vec<[f32; 4]>,
+    pub inv_bind_matrices: Vec<[f32; 16]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +104,8 @@ pub struct DffGeometry {
     pub splits: Vec<DffMeshSplit>,
     pub is_tristrip: bool,
     pub bounding_sphere: [f32; 4],
+    #[serde(default)]
+    pub skin: Option<DffSkin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +175,7 @@ impl DffClump {
 fn parse_frame_list(data: &[u8]) -> Result<Vec<DffFrame>, FormatError> {
     let mut r = BinReader::new(data);
     let mut frames = Vec::new();
+    let mut ext_frame_idx = 0usize;
     while r.remaining() >= 12 {
         let hdr = RwChunkHeader::read(&mut r)?;
         let chunk_end = (r.position() + hdr.size).min(data.len());
@@ -172,23 +196,46 @@ fn parse_frame_list(data: &[u8]) -> Result<Vec<DffFrame>, FormatError> {
                     parent,
                     flags,
                     name: String::new(),
+                    hanim_node_id: None,
+                    hanim_nodes: Vec::new(),
                 });
             }
         } else if hdr.chunk_type == RW_EXTENSION {
-            // Optional node names inside FrameList extension (0x0253F2FE)
             let mut er = BinReader::new(&data[r.position()..chunk_end]);
-            let mut frame_idx = 0usize;
             while er.remaining() >= 12 {
                 let eh = RwChunkHeader::read(&mut er)?;
                 let e_end = (er.position() + eh.size).min(chunk_end - r.position());
-                if eh.chunk_type == 0x0253_F2FE && frame_idx < frames.len() {
+                if eh.chunk_type == 0x0253_F2FE && ext_frame_idx < frames.len() {
                     let s = er.read_fixed_str(eh.size)?;
-                    frames[frame_idx].name = s;
-                    frame_idx += 1;
-                } else {
-                    er.seek(e_end)?;
+                    frames[ext_frame_idx].name = s;
+                } else if eh.chunk_type == RW_HANIM_PLG
+                    && ext_frame_idx < frames.len()
+                    && eh.size >= 12
+                {
+                    let _ver = er.read_u32_le()?;
+                    let node_id = er.read_i32_le()?;
+                    let num_nodes = er.read_u32_le()? as usize;
+                    frames[ext_frame_idx].hanim_node_id = Some(node_id);
+                    if num_nodes > 0 && er.remaining() >= 8 {
+                        let _flags = er.read_u32_le()?;
+                        let _key_frame_size = er.read_u32_le()?;
+                        let mut nodes = Vec::with_capacity(num_nodes.min(256));
+                        for _ in 0..num_nodes {
+                            if er.remaining() < 12 {
+                                break;
+                            }
+                            nodes.push(DffHAnimNode {
+                                node_id: er.read_i32_le()?,
+                                node_index: er.read_i32_le()?,
+                                flags: er.read_u32_le()?,
+                            });
+                        }
+                        frames[ext_frame_idx].hanim_nodes = nodes;
+                    }
                 }
+                er.seek(e_end)?;
             }
+            ext_frame_idx += 1;
         }
         r.seek(chunk_end)?;
     }
@@ -225,7 +272,9 @@ fn parse_geometry(data: &[u8], rw_version: u32) -> Result<DffGeometry, FormatErr
         splits: Vec::new(),
         is_tristrip: false,
         bounding_sphere: [0.0; 4],
+        skin: None,
     };
+    let mut struct_num_verts = 0usize;
 
     while r.remaining() >= 12 {
         let hdr = RwChunkHeader::read(&mut r)?;
@@ -236,6 +285,7 @@ fn parse_geometry(data: &[u8], rw_version: u32) -> Result<DffGeometry, FormatErr
                 let flags = sr.read_u32_le()?;
                 let num_tris = sr.read_u32_le()? as usize;
                 let num_verts = sr.read_u32_le()? as usize;
+                struct_num_verts = num_verts;
                 let _num_morphs = sr.read_u32_le()?;
                 geom.flags = flags;
                 geom.is_tristrip = (flags & 0x01) != 0;
@@ -348,6 +398,65 @@ fn parse_geometry(data: &[u8], rw_version: u32) -> Result<DffGeometry, FormatErr
                             geom.splits.push(DffMeshSplit {
                                 material_index: mat_idx,
                                 indices,
+                            });
+                        }
+                    } else if eh.chunk_type == RW_SKIN_PLG && er.remaining() >= 4 {
+                        let num_bones = er.read_u8()?;
+                        let num_used = er.read_u8()? as usize;
+                        let _max_weights = er.read_u8()?;
+                        let _pad = er.read_u8()?;
+                        if er.remaining() >= num_used {
+                            er.skip(num_used)?;
+                        }
+                        let v_count = if !geom.positions.is_empty() {
+                            geom.positions.len()
+                        } else {
+                            struct_num_verts
+                        };
+                        let mut bone_indices = Vec::with_capacity(v_count);
+                        for _ in 0..v_count {
+                            if er.remaining() < 4 {
+                                break;
+                            }
+                            bone_indices.push(er.read_array::<4>()?);
+                        }
+                        let mut bone_weights = Vec::with_capacity(v_count);
+                        for _ in 0..v_count {
+                            if er.remaining() < 16 {
+                                break;
+                            }
+                            bone_weights.push([
+                                er.read_f32_le()?,
+                                er.read_f32_le()?,
+                                er.read_f32_le()?,
+                                er.read_f32_le()?,
+                            ]);
+                        }
+                        let mut inv_bind_matrices = Vec::with_capacity(usize::from(num_bones));
+                        for _ in 0..num_bones {
+                            if er.remaining() < 64 {
+                                break;
+                            }
+                            let mut m = [0.0f32; 16];
+                            for elem in &mut m {
+                                *elem = er.read_f32_le()?;
+                            }
+                            // Normalize RenderWare matrix padding column elements to valid affine column-major mat4
+                            m[3] = 0.0;
+                            m[7] = 0.0;
+                            m[11] = 0.0;
+                            m[15] = 1.0;
+                            inv_bind_matrices.push(m);
+                        }
+                        if bone_indices.len() == v_count
+                            && bone_weights.len() == v_count
+                            && !inv_bind_matrices.is_empty()
+                        {
+                            geom.skin = Some(DffSkin {
+                                num_bones,
+                                bone_indices,
+                                bone_weights,
+                                inv_bind_matrices,
                             });
                         }
                     }

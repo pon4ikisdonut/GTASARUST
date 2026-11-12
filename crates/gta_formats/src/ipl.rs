@@ -244,14 +244,14 @@ impl IplFile {
                             fields[6].parse().unwrap_or(1.0),
                         ],
                         exit: [
+                            fields[7].parse().unwrap_or(0.0),
                             fields[8].parse().unwrap_or(0.0),
                             fields[9].parse().unwrap_or(0.0),
-                            fields[10].parse().unwrap_or(0.0),
                         ],
-                        exit_rot: fields[11].parse().unwrap_or(0.0),
-                        target_interior: fields[12].parse().unwrap_or(0),
-                        flags: fields[13].parse().unwrap_or(0),
-                        name: fields.get(14).unwrap_or(&"").trim_matches('"').to_string(),
+                        exit_rot: fields[10].parse().unwrap_or(0.0),
+                        target_interior: fields[11].parse().unwrap_or(0),
+                        flags: fields[12].parse().unwrap_or(0),
+                        name: fields[13].trim_matches('"').to_string(),
                     });
                 }
                 IplSection::Zone if fields.len() >= 10 => {
@@ -305,11 +305,15 @@ mod tests {
 
     #[test]
     fn parses_text_and_binary_ipl() {
-        let text =
-            "inst\n3563, LODpmedhos2_LAe, 0, 2063.1, -1731.7, 15.2, 0, 0, 0.707, 0.707, -1\nend\n";
+        let text = "inst\n3563, LODpmedhos2_LAe, 0, 2063.1, -1731.7, 15.2, 0, 0, 0.707, 0.707, -1\nend\nenex\n2495.33, -1690.75, 13.7847, 0, 1.4, 1.4, 8, 2495.33, -1690.25, 13.7847, 0, 0, 4, \"CARLS\", 0, 2, 0, 24\nend\n";
         let parsed = IplFile::parse_text(text);
         assert_eq!(parsed.instances.len(), 1);
         assert_eq!(parsed.instances[0].id, 3563);
+        assert_eq!(parsed.entry_exits.len(), 1);
+        assert_eq!(parsed.entry_exits[0].name, "CARLS");
+        assert_eq!(parsed.entry_exits[0].target_interior, 0);
+        assert!((parsed.entry_exits[0].exit[0] - 2495.33).abs() < 0.01);
+        assert!((parsed.entry_exits[0].exit[1] - (-1690.25)).abs() < 0.01);
 
         // Synthetic binary IPL with 1 instance at offset 0x4C (76) and 1 car spawn at 0x3C (116)
         let mut bin = vec![0u8; 76 + 40 + 48];

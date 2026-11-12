@@ -66,11 +66,72 @@ impl InstanceData {
     }
 }
 
+/// CPU-side skinning bind-pose arrays and bone influences for a `DffSubMesh`.
+#[derive(Debug, Clone)]
+pub struct SkinnedVertexWeights {
+    pub base_positions: Vec<[f32; 3]>,
+    pub base_normals: Vec<[f32; 3]>,
+    pub bone_indices: Vec<[u8; 4]>,
+    pub bone_weights: Vec<[f32; 4]>,
+}
+
 /// CPU-side textured sub-mesh extracted from a RenderWare `.dff` clump.
 pub struct DffSubMesh {
     pub texture_name: Option<String>,
     pub material_color: [f32; 4],
     pub cpu_mesh: CpuMeshData,
+    pub skin_weights: Option<SkinnedVertexWeights>,
+}
+
+impl DffSubMesh {
+    /// Evaluate linear-blend CPU skinning for all vertices using `skin_matrices`, writing
+    /// deformed `Vertex3D` records into `out`.
+    pub fn compute_skinned_vertices(&self, skin_matrices: &[Mat4], out: &mut Vec<Vertex3D>) {
+        out.clear();
+        let Some(sw) = &self.skin_weights else {
+            out.extend_from_slice(&self.cpu_mesh.vertices);
+            return;
+        };
+        if skin_matrices.is_empty() {
+            out.extend_from_slice(&self.cpu_mesh.vertices);
+            return;
+        }
+        out.reserve(self.cpu_mesh.vertices.len());
+        for (i, v) in self.cpu_mesh.vertices.iter().enumerate() {
+            let base_p = Vec3::from_array(sw.base_positions[i]);
+            let base_n = Vec3::from_array(sw.base_normals[i]);
+            let idxs = sw.bone_indices[i];
+            let wgts = sw.bone_weights[i];
+            let mut pos_acc = Vec3::ZERO;
+            let mut nrm_acc = Vec3::ZERO;
+            let mut total_w = 0.0f32;
+            for k in 0..4 {
+                let w = wgts[k];
+                if w <= 1e-5 {
+                    continue;
+                }
+                if let Some(&mat) = skin_matrices.get(usize::from(idxs[k])) {
+                    pos_acc += mat.transform_point3(base_p) * w;
+                    nrm_acc += (Mat3::from_mat4(mat) * base_n) * w;
+                    total_w += w;
+                }
+            }
+            let (position, normal) = if total_w > 1e-4 {
+                (
+                    (pos_acc / total_w).to_array(),
+                    nrm_acc.try_normalize().unwrap_or(base_n).to_array(),
+                )
+            } else {
+                (base_p.to_array(), base_n.to_array())
+            };
+            out.push(Vertex3D {
+                position,
+                normal,
+                uv: v.uv,
+                color: v.color,
+            });
+        }
+    }
 }
 
 #[derive(Default)]
@@ -79,6 +140,7 @@ struct SubMeshAccum {
     material_color: [f32; 4],
     vertices: Vec<Vertex3D>,
     indices: Vec<u32>,
+    skin_weights: Option<SkinnedVertexWeights>,
 }
 
 pub struct CpuMeshData {
@@ -227,6 +289,55 @@ impl CpuMeshData {
         Some(Self { vertices, indices })
     }
 
+    /// Build a downward-pointing GTA:SA entrance/mission cone marker (`apex` at `z = 0`).
+    pub fn marker_cone(radius: f32, height: f32) -> Self {
+        const SEGS: usize = 16;
+        let mut vertices = Vec::with_capacity(SEGS + 2);
+        let mut indices = Vec::with_capacity(SEGS * 6);
+
+        // Vertex 0: downward tip
+        vertices.push(Vertex3D {
+            position: [0.0, 0.0, 0.0],
+            normal: [0.0, 0.0, -1.0],
+            uv: [0.5, 1.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        });
+        // Vertex 1: top center
+        vertices.push(Vertex3D {
+            position: [0.0, 0.0, height],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+        });
+
+        let ring_start = 2u32;
+        for i in 0..SEGS {
+            let angle = (i as f32 / SEGS as f32) * std::f32::consts::TAU;
+            let (s, c) = angle.sin_cos();
+            let nrm = Vec3::new(c * height, s * height, -radius)
+                .try_normalize()
+                .unwrap_or(Vec3::X)
+                .to_array();
+            vertices.push(Vertex3D {
+                position: [c * radius, s * radius, height],
+                normal: nrm,
+                uv: [i as f32 / SEGS as f32, 0.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+            });
+        }
+
+        for i in 0..SEGS {
+            let curr = ring_start + i as u32;
+            let next = ring_start + ((i + 1) % SEGS) as u32;
+            // Outer cone side (CCW looking from outside)
+            indices.extend_from_slice(&[0, next, curr]);
+            // Top cap (+Z normal)
+            indices.extend_from_slice(&[1, curr, next]);
+        }
+
+        Self { vertices, indices }
+    }
+
     /// Compute minimum vertex Z height (useful for aligning multi-part vehicle meshes to ground).
     pub fn min_z(&self) -> f32 {
         self.vertices
@@ -279,6 +390,7 @@ impl CpuMeshData {
                         vertices: acc.vertices,
                         indices: acc.indices,
                     },
+                    skin_weights: acc.skin_weights,
                 })
             })
             .collect()
@@ -417,6 +529,33 @@ fn append_geometry_submeshes(
                         uv,
                         color: vcol,
                     });
+                    if let Some(skin) = &geom.skin {
+                        let sw = entry.skin_weights.get_or_insert_with(|| {
+                            let existing = entry.vertices.len().saturating_sub(1);
+                            SkinnedVertexWeights {
+                                base_positions: entry.vertices[..existing]
+                                    .iter()
+                                    .map(|ev| ev.position)
+                                    .collect(),
+                                base_normals: entry.vertices[..existing]
+                                    .iter()
+                                    .map(|ev| ev.normal)
+                                    .collect(),
+                                bone_indices: vec![[0; 4]; existing],
+                                bone_weights: vec![[1.0, 0.0, 0.0, 0.0]; existing],
+                            }
+                        });
+                        sw.base_positions.push(geom.positions[idx]);
+                        sw.base_normals.push(raw_n);
+                        sw.bone_indices
+                            .push(skin.bone_indices.get(idx).copied().unwrap_or([0; 4]));
+                        sw.bone_weights.push(
+                            skin.bone_weights
+                                .get(idx)
+                                .copied()
+                                .unwrap_or([1.0, 0.0, 0.0, 0.0]),
+                        );
+                    }
                     new_idx
                 });
                 entry.indices.push(mapped);
@@ -478,6 +617,8 @@ mod tests {
                     parent: -1,
                     flags: 0,
                     name: "root".into(),
+                    hanim_node_id: None,
+                    hanim_nodes: Vec::new(),
                 },
                 DffFrame {
                     rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -485,6 +626,8 @@ mod tests {
                     parent: 0,
                     flags: 0,
                     name: "child".into(),
+                    hanim_node_id: None,
+                    hanim_nodes: Vec::new(),
                 },
             ],
             geometries: vec![DffGeometry {
@@ -513,6 +656,7 @@ mod tests {
                 }],
                 is_tristrip: true,
                 bounding_sphere: [0.0; 4],
+                skin: None,
             }],
             atomics: vec![DffAtomic {
                 frame_index: 1,
@@ -568,5 +712,83 @@ mod tests {
                 - Vec3::from_array(v[idx[0] as usize].position),
         );
         assert!(n0.z > 0.0);
+    }
+
+    #[test]
+    fn skinned_submesh_deforms_vertices_from_bone_matrix() {
+        use gtasarust_gta_formats::rw::{DffAtomic, DffMaterial, DffMeshSplit, DffSkin};
+
+        let clump = DffClump {
+            rw_version: 0x36003,
+            frames: vec![DffFrame {
+                rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                position: [0.0, 0.0, 0.0],
+                parent: -1,
+                flags: 0,
+                name: "root".into(),
+                hanim_node_id: Some(0),
+                hanim_nodes: Vec::new(),
+            }],
+            geometries: vec![DffGeometry {
+                flags: 0,
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                uvs: vec![[0.0, 0.0]; 3],
+                colors: vec![[255; 4]; 3],
+                triangles: Vec::new(),
+                materials: vec![DffMaterial {
+                    color: [255, 255, 255, 255],
+                    texture_name: Some("cj_body".into()),
+                    alpha_name: None,
+                    ambient: 1.0,
+                    specular: 0.0,
+                    diffuse: 1.0,
+                }],
+                splits: vec![DffMeshSplit {
+                    material_index: 0,
+                    indices: vec![0, 1, 2],
+                }],
+                is_tristrip: false,
+                bounding_sphere: [0.0; 4],
+                skin: Some(DffSkin {
+                    num_bones: 2,
+                    bone_indices: vec![[1, 0, 0, 0]; 3],
+                    bone_weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+                    inv_bind_matrices: vec![Mat4::IDENTITY.to_cols_array(); 2],
+                }),
+            }],
+            atomics: vec![DffAtomic {
+                frame_index: 0,
+                geometry_index: 0,
+                flags: 0,
+            }],
+        };
+
+        let subs = CpuMeshData::dff_clump_submeshes(&clump);
+        assert_eq!(subs.len(), 1);
+        assert!(subs[0].skin_weights.is_some());
+
+        let mats = vec![
+            Mat4::IDENTITY,
+            Mat4::from_translation(Vec3::new(0.0, 0.0, 2.5)),
+        ];
+        let mut out = Vec::new();
+        subs[0].compute_skinned_vertices(&mats, &mut out);
+        assert_eq!(out.len(), 3);
+        assert!((out[0].position[2] - 2.5).abs() < 1e-4);
+        assert!((out[1].position[0] - 1.0).abs() < 1e-4);
+        assert!((out[1].position[2] - 2.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn marker_cone_has_outward_normals_and_valid_indices() {
+        let cone = CpuMeshData::marker_cone(0.65, 1.1);
+        assert!(!cone.vertices.is_empty());
+        assert_eq!(cone.indices.len() % 3, 0);
+        for &idx in &cone.indices {
+            assert!((idx as usize) < cone.vertices.len());
+        }
+        assert!((cone.vertices[0].position[2] - 0.0).abs() < 1e-4);
+        assert!((cone.vertices[1].position[2] - 1.1).abs() < 1e-4);
     }
 }

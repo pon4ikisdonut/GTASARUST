@@ -6,12 +6,14 @@ This file tracks active defects, regressions, and platform issues discovered dur
 
 | ID | Severity | Subsystem | Summary | Status |
 | --- | --- | --- | --- | --- |
-| — | — | — | No open blockers in Phase 4/6 baseline (next targets: `NODES*.DAT` traffic AI, `audio/streams` Vorbis decoding, `ped.ifp` skeletal playback). | Clear |
+| — | — | — | No open blockers in Milestone E baseline (next targets: `main.scm` bytecode VM & Grove Street campaign missions). | Clear |
 
 ## Resolved Issues
 
 | ID | Severity | Subsystem | Summary | Resolution |
 | --- | --- | --- | --- | --- |
+| BUG-008 | Medium | `gta_formats` / `world` | `IplSection::Enex` skipped field index 6 and read `exit`, `exit_rot`, `target_interior`, `flags`, and `name` shifted by one column. | Corrected field slice mapping to `fields[7..10]` (`exit`), `[10]` (`exit_rot`), `[11]` (`target_interior`), `[12]` (`flags`), `[13]` (`name`), and verified `CARLS` unit test (`target_interior=3`). |
+| BUG-007 | Medium | `gta_formats` / `animation` | `RW_EXTENSION` frame indexing inside `parse_frame_list` misaligned `HAnim` node IDs across frames. | Tracked `ext_frame_idx` once per extension chunk inside `rw.rs` and verified full `fam1.dff` + `ped.ifp` CPU skinning (`1,011` moved vertices). |
 | BUG-001 | Low | `gta_formats` / Audio | 0-byte placeholder radio stream files (`AA`, `CO`, `CR`, `DS`, `HC`, `MH`, `MR`, `RE`, `RG`, `TK`) in local SA install (`E:\gtasa`). | Handled gracefully in `asset_pipeline` inspector (emits non-fatal warnings) and `AudioEngine`. |
 | BUG-002 | High | `ui` | `egui 0.37` shipped without `default_fonts` in default features, causing empty font provider errors at runtime. | Enabled `default_fonts` feature on `egui` in root `Cargo.toml`; verified zero UI font errors on launch. |
 | BUG-003 | Low | `game` | `run_headless_smoke` reported `ticks=0` because it bypassed `FixedTimestep::accumulate`. | Updated `run_headless_smoke` to track `timestep.total_ticks` across all 60 ticks. |

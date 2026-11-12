@@ -335,13 +335,26 @@ impl WorldManager {
             if let Ok(gta_int_path) = vfs.resolve("models/gta_int.img")
                 && let Ok(img) = ImgArchive::open(&gta_int_path)
             {
-                let col_entries: Vec<_> = img
-                    .entries()
-                    .iter()
-                    .filter(|e| e.name.to_ascii_lowercase().ends_with(".col"))
-                    .cloned()
-                    .collect();
-                for entry in col_entries {
+                let mut int_ipls = Vec::new();
+                let mut int_cols = Vec::new();
+                for e in img.entries() {
+                    let lower = e.name.to_ascii_lowercase();
+                    if lower.ends_with(".ipl") {
+                        int_ipls.push(e.clone());
+                    } else if lower.ends_with(".col") {
+                        int_cols.push(e.clone());
+                    }
+                }
+                for entry in int_ipls {
+                    if let Ok(bytes) = img.read_entry_data(&entry)
+                        && let Ok(ipl) = IplFile::parse_bytes(&bytes)
+                    {
+                        raw_instances.extend(ipl.instances);
+                        world.car_spawns.extend(ipl.car_spawns);
+                        world.entry_exits.extend(ipl.entry_exits);
+                    }
+                }
+                for entry in int_cols {
                     if let Ok(bytes) = img.read_entry_data(&entry)
                         && let Ok(parsed) = parse_col_archive(&bytes)
                     {
@@ -501,6 +514,31 @@ impl WorldManager {
             .filter_map(|sc| self.sectors.get(sc))
             .flatten()
             .filter(move |p| p.interior == interior)
+    }
+
+    /// Iterate `ENEX` entry/exit portals near `pos` within `radius` matching `current_interior`.
+    pub fn nearby_enex(&self, pos: Vec3, current_interior: i32, radius: f32) -> Vec<&IplEntryExit> {
+        let r2 = radius * radius;
+        self.entry_exits
+            .iter()
+            .filter(|e| {
+                e.target_interior == current_interior
+                    && Vec3::from_array(e.entrance).distance_squared(pos) <= r2
+            })
+            .collect()
+    }
+
+    /// Find the paired exit marker matching `source.name` across interior boundary.
+    pub fn find_paired_enex(
+        &self,
+        source: &IplEntryExit,
+        current_interior: i32,
+    ) -> Option<&IplEntryExit> {
+        self.entry_exits.iter().find(|candidate| {
+            !source.name.is_empty()
+                && candidate.name.eq_ignore_ascii_case(&source.name)
+                && candidate.target_interior != current_interior
+        })
     }
 
     /// Resolve current San Andreas region/zone name for a world coordinate.

@@ -1,21 +1,24 @@
 use anyhow::Result;
 use glam::{Quat, Vec3};
 use gtasarust_ai::{AiSimulation, CrimeEvent, PedBehavior};
+use gtasarust_animation::{AnimState, AnimationController, IfpPoseLibrary, compute_skin_matrices};
 use gtasarust_audio::{AudioEngine, SfxCue};
 use gtasarust_engine::{EngineConfig, FixedTimestep, GameClock, GameDataRoot, HostInfo};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
 use gtasarust_gta_formats::{
     dat::HandlingCfg,
     gxt::GxtArchive,
+    ifp::IfpArchive,
     img::ImgArchive,
-    rw::{DffClump, TxdArchive},
+    rw::{DffClump, DffFrame, DffSkin, TxdArchive},
 };
 use gtasarust_input::{ActionFrameState, ControlMode, InputManager};
 use gtasarust_localization::LocalizationTable;
 use gtasarust_missions::MissionManager;
 use gtasarust_physics::{ColliderHandle, PhysicsWorld};
 use gtasarust_renderer::{
-    CameraState, GpuMeshHandle, InstanceData, RenderInstanceBatch, SceneRenderer, mesh::CpuMeshData,
+    CameraState, DffSubMesh, GpuMeshHandle, InstanceData, RenderInstanceBatch, SceneRenderer,
+    Vertex3D, mesh::CpuMeshData,
 };
 use gtasarust_save_system::{SaveGameData, SavedWeaponSlot, read_save_slot, write_save_slot};
 use gtasarust_scripting::ScmVm;
@@ -37,6 +40,18 @@ pub struct CachedSubMesh {
 pub struct CachedDffModel {
     pub submeshes: Vec<CachedSubMesh>,
     pub min_z: f32,
+}
+
+pub struct SkinnedSubMeshTemplate {
+    pub sub: DffSubMesh,
+    pub texture_idx: usize,
+    pub material_color: [f32; 4],
+}
+
+pub struct CachedSkinnedPedRig {
+    pub frames: Vec<DffFrame>,
+    pub skin: Option<DffSkin>,
+    pub submeshes: Vec<SkinnedSubMeshTemplate>,
 }
 
 pub struct GameWorldState {
@@ -61,12 +76,26 @@ pub struct GameWorldState {
     pub gta3_archive: Option<ImgArchive>,
     pub gta_int_archive: Option<ImgArchive>,
     pub handling: Option<HandlingCfg>,
+    pub ped_ifp_lib: IfpPoseLibrary,
     pub cached_textures: HashMap<String, usize>,
     pub loaded_txds: HashSet<String>,
     pub cached_dff_meshes: HashMap<String, CachedDffModel>,
+    pub ped_rigs: HashMap<String, CachedSkinnedPedRig>,
+    pub cj_skinned_meshes: Vec<(GpuMeshHandle, usize, [f32; 4])>,
+    pub ped_skinned_meshes: HashMap<u64, (String, Vec<GpuMeshHandle>)>,
+    skin_vertex_scratch: Vec<Vertex3D>,
     pub failed_dff_lookups: HashSet<String>,
     pub sector_colliders: HashMap<SectorCoord, Vec<ColliderHandle>>,
+    pub loaded_collider_interior: i32,
     pub water_mesh: Option<GpuMeshHandle>,
+    pub marker_mesh: Option<GpuMeshHandle>,
+    pub enex_cooldown: f32,
+    pub enex_lock_pos: Option<Vec3>,
+    pub interior_floor_z: Option<f32>,
+    pub active_enex_name: Option<String>,
+    pub interior_service_pos: Option<Vec3>,
+    pub service_cooldown: f32,
+    pub status_message_timer: f32,
 }
 
 impl GameWorldState {
@@ -78,6 +107,7 @@ impl GameWorldState {
         let mut gta_int_archive = None;
         let mut handling = None;
         let mut opened_vfs = None;
+        let mut ped_ifp_lib = IfpPoseLibrary::default();
 
         let world = if let Some(dir) = &config.game_data_dir {
             match GameDataRoot::open(dir) {
@@ -92,6 +122,12 @@ impl GameWorldState {
                     {
                         info!(entries = gxt.total_entries(), "Loaded GXT localization");
                         localization.attach_gxt(gxt);
+                    }
+                    if let Ok(ifp_bytes) = vfs.read_bytes("anim/ped.ifp")
+                        && let Ok(archive) = IfpArchive::parse_full(&ifp_bytes)
+                    {
+                        let clips = ped_ifp_lib.insert_archive(archive);
+                        info!(clips, "Loaded ped.ifp skeletal animation clips");
                     }
                     if let Ok(img_path) = vfs.resolve("models/gta3.img") {
                         gta3_archive = ImgArchive::open(&img_path).ok();
@@ -197,12 +233,26 @@ impl GameWorldState {
             gta3_archive,
             gta_int_archive,
             handling,
+            ped_ifp_lib,
             cached_textures: HashMap::new(),
             loaded_txds: HashSet::new(),
             cached_dff_meshes: HashMap::new(),
+            ped_rigs: HashMap::new(),
+            cj_skinned_meshes: Vec::new(),
+            ped_skinned_meshes: HashMap::new(),
+            skin_vertex_scratch: Vec::new(),
             failed_dff_lookups: HashSet::new(),
             sector_colliders: HashMap::new(),
+            loaded_collider_interior: 0,
             water_mesh: None,
+            marker_mesh: None,
+            enex_cooldown: 0.0,
+            enex_lock_pos: None,
+            interior_floor_z: None,
+            active_enex_name: None,
+            interior_service_pos: None,
+            service_cooldown: 0.0,
+            status_message_timer: 0.0,
         };
         if state.world.loaded_from_original_data {
             state.spawn_nearby_ipl_vehicles(260.0, 20);
@@ -349,10 +399,62 @@ impl GameWorldState {
         true
     }
 
+    fn load_ped_rig(&mut self, renderer: &mut SceneRenderer, model_lower: &str) -> bool {
+        if self.ped_rigs.contains_key(model_lower) {
+            return true;
+        }
+        let dff_name = format!("{model_lower}.dff");
+        if self.failed_dff_lookups.contains(&dff_name) {
+            return false;
+        }
+        self.ensure_txd_loaded(renderer, model_lower);
+        let Some(bytes) = self.read_archive_entry(&dff_name) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let Ok(clump) = DffClump::parse(&bytes) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let subs = CpuMeshData::dff_clump_submeshes(&clump);
+        if subs.is_empty() {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        }
+        let skin = clump.geometries.iter().find_map(|g| g.skin.clone());
+        let submeshes = subs
+            .into_iter()
+            .map(|sub| {
+                let texture_idx = self.resolve_texture_idx(
+                    model_lower,
+                    sub.texture_name.as_deref(),
+                    renderer.white_tex,
+                );
+                let material_color = sub.material_color;
+                SkinnedSubMeshTemplate {
+                    sub,
+                    texture_idx,
+                    material_color,
+                }
+            })
+            .collect();
+        self.ped_rigs.insert(
+            model_lower.to_string(),
+            CachedSkinnedPedRig {
+                frames: clump.frames,
+                skin,
+                submeshes,
+            },
+        );
+        true
+    }
+
     pub fn preload_render_meshes(&mut self, renderer: &mut SceneRenderer) {
         if let Some(water_cpu) = CpuMeshData::from_water_quads(&self.world.water_quads) {
             self.water_mesh = Some(renderer.upload_mesh("sa_water_quads", &water_cpu));
         }
+        self.marker_mesh =
+            Some(renderer.upload_mesh("sa_enex_marker", &CpuMeshData::marker_cone(0.62, 1.15)));
         if self.gta3_archive.is_none() && self.gta_int_archive.is_none() {
             return;
         }
@@ -360,6 +462,11 @@ impl GameWorldState {
         // Shared vehicle/generic TXDs resolved as parent fallback textures
         for shared_txd in ["vehicle", "misc", "particle"] {
             self.ensure_txd_loaded(renderer, shared_txd);
+        }
+
+        // Skinned pedestrian models (`ped.ifp` bone rigs)
+        for ped_model in ["fam1", "fam2", "fam3", "bmydj", "lapd1", "hmost"] {
+            self.load_ped_rig(renderer, ped_model);
         }
 
         // Preload starter vehicles (`GREENWOO`, `BMX`, `INFERNUS`, `COPCARLA`)
@@ -423,7 +530,7 @@ impl GameWorldState {
                 pending.push((0.0, model_lower, txd_lower));
             }
         }
-        for p in self.world.active_placements(self.player.interior_zero()) {
+        for p in self.world.active_placements(self.player.interior) {
             if p.is_lod {
                 continue;
             }
@@ -451,19 +558,150 @@ impl GameWorldState {
         loaded
     }
 
-    /// Keep `PhysicsWorld` static `.col` colliders synchronized with active world sectors.
-    pub fn sync_collision_sectors(&mut self) {
-        if self.world.col_models.is_empty() {
+    /// Deform CJ & active NPC pedestrian vertex buffers using sampled `ped.ifp` bone poses.
+    pub fn update_skinned_meshes(&mut self, renderer: &mut SceneRenderer) {
+        if self.ped_rigs.is_empty() {
             return;
         }
-        let interior = self.player.interior_zero();
+
+        // Update CJ (skinned "fam1" rig)
+        if self.player.control_mode == ControlMode::OnFoot
+            && let Some(rig) = self.ped_rigs.get("fam1")
+        {
+            if self.cj_skinned_meshes.is_empty() {
+                for (idx, tpl) in rig.submeshes.iter().enumerate() {
+                    let handle =
+                        renderer.upload_dynamic_mesh(&format!("cj_skin#{idx}"), &tpl.sub.cpu_mesh);
+                    self.cj_skinned_meshes
+                        .push((handle, tpl.texture_idx, tpl.material_color));
+                }
+            }
+            if !self.ped_ifp_lib.is_empty()
+                && let Some(skin) = &rig.skin
+            {
+                let poses = self.player.anim.sample_poses(&self.ped_ifp_lib);
+                let mats = compute_skin_matrices(&rig.frames, skin, &poses);
+                if !mats.is_empty() {
+                    for (idx, tpl) in rig.submeshes.iter().enumerate() {
+                        if tpl.sub.skin_weights.is_some()
+                            && let Some(&(handle, _, _)) = self.cj_skinned_meshes.get(idx)
+                        {
+                            tpl.sub
+                                .compute_skinned_vertices(&mats, &mut self.skin_vertex_scratch);
+                            renderer.update_mesh_vertices(handle, &self.skin_vertex_scratch);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prune despawned or dead pedestrian dynamic mesh handles
+        self.ped_skinned_meshes.retain(|pid, _| {
+            self.ai
+                .pedestrians
+                .iter()
+                .any(|p| p.id == *pid && p.health > 0.0)
+        });
+
+        let Self {
+            ped_rigs,
+            ped_ifp_lib,
+            ped_skinned_meshes,
+            skin_vertex_scratch,
+            ai,
+            player,
+            timestep,
+            ..
+        } = self;
+
+        for ped in &ai.pedestrians {
+            if ped.health <= 0.0 || ped.position.distance_squared(player.position) > 75.0 * 75.0 {
+                continue;
+            }
+            let preferred = ped_model_name_for(ped.model_id);
+            let model_key = if ped_rigs.contains_key(preferred) {
+                preferred
+            } else if ped_rigs.contains_key("fam2") {
+                "fam2"
+            } else if ped_rigs.contains_key("fam1") {
+                "fam1"
+            } else {
+                continue;
+            };
+            let Some(rig) = ped_rigs.get(model_key) else {
+                continue;
+            };
+
+            let (_, handles) = ped_skinned_meshes.entry(ped.id).or_insert_with(|| {
+                let hs = rig
+                    .submeshes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, tpl)| {
+                        renderer.upload_dynamic_mesh(
+                            &format!("ped_{}_{model_key}#{idx}", ped.id),
+                            &tpl.sub.cpu_mesh,
+                        )
+                    })
+                    .collect();
+                (model_key.to_string(), hs)
+            });
+
+            if !ped_ifp_lib.is_empty()
+                && let Some(skin) = &rig.skin
+            {
+                let npc_state = match ped.behavior {
+                    PedBehavior::Idle => AnimState::Idle,
+                    PedBehavior::Patrol => AnimState::Walk,
+                    PedBehavior::FleePanic => AnimState::Sprint,
+                    PedBehavior::PolicePursuit | PedBehavior::GangHostile => AnimState::Run,
+                };
+                let phase = (timestep.total_sim_time as f32) + (ped.id as f32) * 0.67;
+                let poses = ped_ifp_lib.sample_clip(
+                    AnimationController::clip_name_for(npc_state),
+                    phase,
+                    true,
+                );
+                let mats = compute_skin_matrices(&rig.frames, skin, &poses);
+                if !mats.is_empty() {
+                    for (idx, tpl) in rig.submeshes.iter().enumerate() {
+                        if tpl.sub.skin_weights.is_some()
+                            && let Some(&handle) = handles.get(idx)
+                        {
+                            tpl.sub.compute_skinned_vertices(&mats, skin_vertex_scratch);
+                            renderer.update_mesh_vertices(handle, skin_vertex_scratch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep `PhysicsWorld` static `.col` colliders synchronized with active world sectors.
+    pub fn sync_collision_sectors(&mut self) {
+        let mut changed = false;
+        let interior = self.player.interior;
+        if self.loaded_collider_interior != interior {
+            for (_, handles) in self.sector_colliders.drain() {
+                for h in handles {
+                    self.physics.remove_collider(h);
+                }
+                changed = true;
+            }
+            self.loaded_collider_interior = interior;
+        }
+        if self.world.col_models.is_empty() {
+            if changed {
+                self.physics.sync_queries();
+            }
+            return;
+        }
         let stale: Vec<SectorCoord> = self
             .sector_colliders
             .keys()
             .copied()
             .filter(|sc| !self.world.active_sectors.contains(sc))
             .collect();
-        let mut changed = false;
         for sc in stale {
             if let Some(handles) = self.sector_colliders.remove(&sc) {
                 for h in handles {
@@ -714,10 +952,160 @@ impl GameWorldState {
         }
     }
 
+    fn set_status(&mut self, msg: impl Into<String>, duration: f32) {
+        self.ui_state.status_message = Some(msg.into());
+        self.status_message_timer = duration;
+    }
+
+    fn try_handle_enex_transition(&mut self) {
+        if let Some(lock_pos) = self.enex_lock_pos
+            && self.player.position.distance_squared(lock_pos) > 2.6 * 2.6
+        {
+            self.enex_lock_pos = None;
+        }
+        if self.player.control_mode != ControlMode::OnFoot
+            || self.enex_cooldown > 0.0
+            || self.enex_lock_pos.is_some()
+        {
+            return;
+        }
+        let candidates = self
+            .world
+            .nearby_enex(self.player.position, self.player.interior, 1.55);
+        let Some(source) = candidates.into_iter().min_by(|a, b| {
+            let da = Vec3::from_array(a.entrance).distance_squared(self.player.position);
+            let db = Vec3::from_array(b.entrance).distance_squared(self.player.position);
+            da.total_cmp(&db)
+        }) else {
+            return;
+        };
+        let Some(dest) = self
+            .world
+            .find_paired_enex(source, self.player.interior)
+            .cloned()
+        else {
+            return;
+        };
+
+        let dest_yaw = (dest.exit_rot + 90.0).to_radians();
+        self.player.position = Vec3::from_array(dest.exit);
+        self.player.yaw = dest_yaw;
+        self.player.velocity = Vec3::ZERO;
+        self.player.interior = dest.target_interior;
+        self.enex_cooldown = 1.5;
+        self.enex_lock_pos = Some(Vec3::from_array(dest.entrance));
+
+        self.world
+            .update_streaming(self.player.position, self.config.graphics.draw_distance);
+        self.sync_collision_sectors();
+
+        if dest.target_interior != 0 {
+            if !self.world.col_models.is_empty()
+                && let Some(gz) = self.physics.ground_height_below(
+                    dest.exit[0],
+                    dest.exit[1],
+                    dest.exit[2] + 2.0,
+                    5.0,
+                )
+            {
+                self.player.position.z = gz + 0.05;
+                self.interior_floor_z = Some(gz - 0.5);
+            } else {
+                self.interior_floor_z = Some(dest.exit[2] - 0.35);
+            }
+            let upper = dest.name.to_ascii_uppercase();
+            let fwd = Vec3::new(dest_yaw.cos(), dest_yaw.sin(), 0.0);
+            self.interior_service_pos =
+                if upper == "CARLS" || upper.starts_with("FDCHICK") || upper.starts_with("AMMUN") {
+                    Some(self.player.position + fwd * 4.5)
+                } else {
+                    None
+                };
+            self.active_enex_name = Some(upper.clone());
+            self.set_status(
+                format!("Entered {upper} (Interior {})", dest.target_interior),
+                4.0,
+            );
+        } else {
+            self.interior_floor_z = None;
+            self.active_enex_name = None;
+            self.interior_service_pos = None;
+            if !self.world.col_models.is_empty()
+                && let Some(gz) = self.physics.ground_height_below(
+                    dest.exit[0],
+                    dest.exit[1],
+                    dest.exit[2] + 3.0,
+                    8.0,
+                )
+            {
+                self.player.position.z = gz + 0.05;
+            }
+            self.set_status("Exited to San Andreas", 3.0);
+        }
+    }
+
+    fn try_handle_interior_service(&mut self) {
+        if self.player.interior == 0 || self.service_cooldown > 0.0 {
+            return;
+        }
+        let Some(svc_pos) = self.interior_service_pos else {
+            return;
+        };
+        if self.player.position.truncate().distance(svc_pos.truncate()) > 1.65 {
+            return;
+        }
+        match self.active_enex_name.as_deref() {
+            Some("CARLS") => {
+                self.player.health = self.player.max_health;
+                let data = self.to_save_data(1);
+                match write_save_slot(&self.host.save_dir, 1, &data) {
+                    Ok(_) => self.set_status("Safehouse: Health restored & saved to Slot 1", 4.5),
+                    Err(e) => self.set_status(format!("Safehouse heal ok (save error: {e})"), 4.5),
+                }
+                self.service_cooldown = 4.0;
+            }
+            Some(name) if name.starts_with("FDCHICK") => {
+                if self.player.money >= 10 {
+                    self.player.money -= 10;
+                    self.player.health = (self.player.health + 50.0).min(self.player.max_health);
+                    self.set_status("Cluckin' Bell: Bought meal (-$10, +50 HP)", 4.0);
+                } else {
+                    self.set_status("Cluckin' Bell: Need $10 for meal", 3.5);
+                }
+                self.service_cooldown = 3.5;
+            }
+            Some(name) if name.starts_with("AMMUN") => {
+                if self.player.money >= 200 {
+                    self.player.money -= 200;
+                    if let Some(slot2) = &mut self.player.weapons.slots[2] {
+                        slot2.reserve_ammo += 50;
+                    } else {
+                        self.player
+                            .weapons
+                            .give_weapon(WeaponInventory::preset_colt45(), 50);
+                    }
+                    self.set_status("Ammu-Nation: Purchased 9mm +50 rounds (-$200)", 4.0);
+                } else {
+                    self.set_status("Ammu-Nation: Need $200 for 9mm ammo", 3.5);
+                }
+                self.service_cooldown = 3.5;
+            }
+            _ => {}
+        }
+    }
+
     pub fn step_fixed_tick(&mut self, dt: f32, actions: &ActionFrameState) {
         self.clock.advance(dt);
         self.audio.apply_config(&self.config.audio);
         self.audio.update(dt);
+        self.enex_cooldown = (self.enex_cooldown - dt).max(0.0);
+        self.service_cooldown = (self.service_cooldown - dt).max(0.0);
+        if self.status_message_timer > 0.0 {
+            self.status_message_timer -= dt;
+            if self.status_message_timer <= 0.0 {
+                self.ui_state.status_message = None;
+            }
+        }
 
         if actions.enter_exit_just_pressed {
             let was_on_foot = self.player.control_mode == ControlMode::OnFoot;
@@ -773,6 +1161,16 @@ impl GameWorldState {
         }
 
         self.player.update_on_foot(dt, actions, &self.physics);
+        if self.player.interior != 0
+            && let Some(floor_z) = self.interior_floor_z
+            && self.player.position.z < floor_z
+        {
+            self.player.position.z = floor_z;
+            self.player.velocity.z = 0.0;
+            self.player.grounded = true;
+        }
+        self.try_handle_enex_transition();
+        self.try_handle_interior_service();
         if self.player.control_mode == ControlMode::OnFoot
             && self.player.grounded
             && self.player.velocity.truncate().length() > 1.2
@@ -867,6 +1265,10 @@ impl GameWorldState {
                 .weapons
                 .give_weapon(WeaponInventory::preset_colt45(), 51);
             self.missions = MissionManager::new_san_andreas_campaign();
+            self.interior_floor_z = None;
+            self.active_enex_name = None;
+            self.interior_service_pos = None;
+            self.enex_lock_pos = None;
             self.world
                 .update_streaming(self.player.position, self.config.graphics.draw_distance);
             self.sync_collision_sectors();
@@ -892,6 +1294,11 @@ impl GameWorldState {
             self.player.position = tp;
             self.player.current_vehicle = None;
             self.player.control_mode = ControlMode::OnFoot;
+            self.player.interior = 0;
+            self.interior_floor_z = None;
+            self.active_enex_name = None;
+            self.interior_service_pos = None;
+            self.enex_lock_pos = None;
             self.world
                 .update_streaming(self.player.position, self.config.graphics.draw_distance);
             self.sync_collision_sectors();
@@ -940,6 +1347,7 @@ impl GameWorldState {
             game_day: self.clock.day,
             player_position: self.player.position.to_array(),
             player_yaw: self.player.yaw,
+            interior: self.player.interior,
             health: self.player.health,
             max_health: self.player.max_health,
             armor: self.player.armor,
@@ -970,6 +1378,7 @@ impl GameWorldState {
         self.clock.day = data.game_day;
         self.player.position = Vec3::from_array(data.player_position);
         self.player.yaw = data.player_yaw;
+        self.player.interior = data.interior;
         self.player.health = data.health;
         self.player.max_health = data.max_health;
         self.player.armor = data.armor;
@@ -977,82 +1386,127 @@ impl GameWorldState {
         self.player.respect = data.respect;
         self.player.wanted_stars = data.wanted_stars;
         self.missions.completed = data.completed_missions;
+        self.interior_floor_z = (self.player.interior != 0).then_some(self.player.position.z - 0.5);
+        self.world
+            .update_streaming(self.player.position, self.config.graphics.draw_distance);
+        self.sync_collision_sectors();
     }
 
     pub fn collect_render_batches(&self, renderer: &SceneRenderer) -> Vec<RenderInstanceBatch> {
         let frustum = self.camera.frustum();
-        let ground_z = if self.world.loaded_from_original_data {
-            -0.25
+        let in_exterior = self.player.interior == 0;
+        let ground_instances = if in_exterior {
+            let ground_z = if self.world.loaded_from_original_data {
+                -0.25
+            } else {
+                0.0
+            };
+            vec![InstanceData::from_transform(
+                Vec3::new(self.player.position.x, self.player.position.y, ground_z),
+                Quat::IDENTITY,
+                Vec3::ONE,
+                [0.85, 0.88, 0.80, 1.0],
+            )]
         } else {
-            0.0
+            Vec::new()
         };
-        let ground_instances = vec![InstanceData::from_transform(
-            Vec3::new(self.player.position.x, self.player.position.y, ground_z),
-            Quat::IDENTITY,
-            Vec3::ONE,
-            [0.85, 0.88, 0.80, 1.0],
-        )];
 
         let mut box_instances = Vec::new();
         let mut custom_batches: HashMap<(usize, usize), Vec<InstanceData>> = HashMap::new();
 
-        // Player character (CJ) when on foot
+        // Player character (CJ) when on foot (skinned ped.ifp rig when available, fallback box)
         if self.player.control_mode == ControlMode::OnFoot {
-            box_instances.push(InstanceData::from_transform(
-                self.player.position + Vec3::new(0.0, 0.0, 0.9),
-                Quat::from_rotation_z(self.player.yaw),
-                Vec3::new(0.65, 0.45, 1.8),
-                [0.95, 0.95, 0.95, 1.0], // White tank top
-            ));
-        }
-
-        // Vehicles (use real RenderWare DFF+TXD submeshes when available, fallback to colored bounds)
-        for v in &self.vehicles.vehicles {
-            if !frustum.intersects_sphere(v.position, 6.0) {
-                continue;
-            }
-            let dff_key = format!("{}.dff", v.name.to_ascii_lowercase());
-            if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
-                let z_lift = (-model.min_z).clamp(0.0, 1.5);
-                let pos = v.position + Vec3::new(0.0, 0.0, z_lift);
-                // Match RenderWare GTA:SA forward-axis (+Y) orientation cleanly to yaw rotation
-                let rot = v.rotation_quat() * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
-                for sub in &model.submeshes {
-                    let tint = apply_vehicle_paint_tint(sub.material_color, v.color1, v.color2);
+            if !self.cj_skinned_meshes.is_empty() {
+                let rot = Quat::from_rotation_z(self.player.yaw - std::f32::consts::FRAC_PI_2);
+                let pos = self.player.position + Vec3::Z;
+                for &(mesh, tex_idx, mat_col) in &self.cj_skinned_meshes {
                     custom_batches
-                        .entry((sub.mesh.0, sub.texture_idx))
+                        .entry((mesh.0, tex_idx))
                         .or_default()
-                        .push(InstanceData::from_transform(pos, rot, Vec3::ONE, tint));
+                        .push(InstanceData::from_transform(pos, rot, Vec3::ONE, mat_col));
                 }
             } else {
-                let scale = match v.params.class {
-                    VehicleClass::Bicycle | VehicleClass::Motorcycle => Vec3::new(1.8, 0.7, 1.1),
-                    VehicleClass::Truck | VehicleClass::Bus => Vec3::new(6.8, 2.5, 2.8),
-                    _ => Vec3::new(4.3, 1.9, 1.45),
-                };
                 box_instances.push(InstanceData::from_transform(
-                    v.position + Vec3::new(0.0, 0.0, scale.z * 0.5),
-                    v.rotation_quat(),
-                    scale,
-                    [v.color1[0], v.color1[1], v.color1[2], 1.0],
+                    self.player.position + Vec3::new(0.0, 0.0, 0.9),
+                    Quat::from_rotation_z(self.player.yaw),
+                    Vec3::new(0.65, 0.45, 1.8),
+                    [0.95, 0.95, 0.95, 1.0], // White tank top
                 ));
             }
         }
 
-        // Pedestrians & Police
-        for ped in &self.ai.pedestrians {
-            if ped.health > 0.0 && frustum.intersects_sphere(ped.position, 2.0) {
-                let col = if ped.is_cop {
-                    [0.15, 0.30, 0.75, 1.0]
+        if in_exterior {
+            // Vehicles (use real RenderWare DFF+TXD submeshes when available, fallback to colored bounds)
+            for v in &self.vehicles.vehicles {
+                if !frustum.intersects_sphere(v.position, 6.0) {
+                    continue;
+                }
+                let dff_key = format!("{}.dff", v.name.to_ascii_lowercase());
+                if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
+                    let z_lift = (-model.min_z).clamp(0.0, 1.5);
+                    let pos = v.position + Vec3::new(0.0, 0.0, z_lift);
+                    // Match RenderWare GTA:SA forward-axis (+Y) orientation cleanly to yaw rotation
+                    let rot =
+                        v.rotation_quat() * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
+                    for sub in &model.submeshes {
+                        let tint = apply_vehicle_paint_tint(sub.material_color, v.color1, v.color2);
+                        custom_batches
+                            .entry((sub.mesh.0, sub.texture_idx))
+                            .or_default()
+                            .push(InstanceData::from_transform(pos, rot, Vec3::ONE, tint));
+                    }
                 } else {
-                    [0.20, 0.65, 0.25, 1.0]
-                };
-                box_instances.push(InstanceData::from_transform(
-                    ped.position + Vec3::new(0.0, 0.0, 0.85),
-                    Quat::from_rotation_z(ped.yaw),
-                    Vec3::new(0.6, 0.4, 1.7),
-                    col,
-                ));
+                    let scale = match v.params.class {
+                        VehicleClass::Bicycle | VehicleClass::Motorcycle => {
+                            Vec3::new(1.8, 0.7, 1.1)
+                        }
+                        VehicleClass::Truck | VehicleClass::Bus => Vec3::new(6.8, 2.5, 2.8),
+                        _ => Vec3::new(4.3, 1.9, 1.45),
+                    };
+                    box_instances.push(InstanceData::from_transform(
+                        v.position + Vec3::new(0.0, 0.0, scale.z * 0.5),
+                        v.rotation_quat(),
+                        scale,
+                        [v.color1[0], v.color1[1], v.color1[2], 1.0],
+                    ));
+                }
+            }
+
+            // Pedestrians & Police (skinned ped.ifp models when uploaded, fallback colored box)
+            for ped in &self.ai.pedestrians {
+                if ped.health > 0.0 && frustum.intersects_sphere(ped.position, 2.0) {
+                    if let Some((model_key, handles)) = self.ped_skinned_meshes.get(&ped.id)
+                        && let Some(rig) = self.ped_rigs.get(model_key)
+                    {
+                        let rot = Quat::from_rotation_z(ped.yaw - std::f32::consts::FRAC_PI_2);
+                        let pos = ped.position + Vec3::Z;
+                        for (idx, handle) in handles.iter().enumerate() {
+                            if let Some(tpl) = rig.submeshes.get(idx) {
+                                custom_batches
+                                    .entry((handle.0, tpl.texture_idx))
+                                    .or_default()
+                                    .push(InstanceData::from_transform(
+                                        pos,
+                                        rot,
+                                        Vec3::ONE,
+                                        tpl.material_color,
+                                    ));
+                            }
+                        }
+                    } else {
+                        let col = if ped.is_cop {
+                            [0.15, 0.30, 0.75, 1.0]
+                        } else {
+                            [0.20, 0.65, 0.25, 1.0]
+                        };
+                        box_instances.push(InstanceData::from_transform(
+                            ped.position + Vec3::new(0.0, 0.0, 0.85),
+                            Quat::from_rotation_z(ped.yaw),
+                            Vec3::new(0.6, 0.4, 1.7),
+                            col,
+                        ));
+                    }
+                }
             }
         }
 
@@ -1078,8 +1532,58 @@ impl GameWorldState {
             ));
         }
 
+        // Floating ENEX doorway & interior counter markers
+        if let Some(marker) = self.marker_mesh {
+            let t = self.timestep.total_sim_time as f32;
+            let bob = (t * 3.0).sin() * 0.14;
+            let spin = Quat::from_rotation_z(t * 1.6);
+            let cur_int = self.player.interior;
+            let mut marker_instances = Vec::new();
+            for e in &self.world.entry_exits {
+                if e.target_interior != cur_int {
+                    continue;
+                }
+                let pos = Vec3::from_array(e.entrance);
+                if pos.distance_squared(self.player.position) <= 120.0 * 120.0
+                    && frustum.intersects_sphere(pos + Vec3::Z, 2.0)
+                {
+                    marker_instances.push(InstanceData::from_transform(
+                        pos + Vec3::new(0.0, 0.0, 1.1 + bob),
+                        spin,
+                        Vec3::ONE,
+                        [1.0, 0.85, 0.12, 0.92],
+                    ));
+                }
+            }
+            if cur_int != 0
+                && let Some(svc_pos) = self.interior_service_pos
+            {
+                let svc_color = if self
+                    .active_enex_name
+                    .as_deref()
+                    .is_some_and(|n| n.starts_with("AMMUN"))
+                {
+                    [0.20, 0.72, 1.0, 0.95]
+                } else {
+                    [0.18, 0.92, 0.36, 0.95]
+                };
+                marker_instances.push(InstanceData::from_transform(
+                    svc_pos + Vec3::new(0.0, 0.0, 1.05 + bob),
+                    spin,
+                    Vec3::ONE,
+                    svc_color,
+                ));
+            }
+            if !marker_instances.is_empty() {
+                custom_batches
+                    .entry((marker.0, renderer.white_tex))
+                    .or_default()
+                    .extend(marker_instances);
+            }
+        }
+
         // World streamed objects (actual textured RenderWare DFF submeshes when loaded, or fallback blocks)
-        for p in self.world.active_placements(self.player.interior_zero()) {
+        for p in self.world.active_placements(self.player.interior) {
             if p.is_lod {
                 continue;
             }
@@ -1109,20 +1613,21 @@ impl GameWorldState {
             }
         }
 
-        let mut batches = vec![
-            RenderInstanceBatch {
+        let mut batches = Vec::new();
+        if !ground_instances.is_empty() {
+            batches.push(RenderInstanceBatch {
                 mesh: renderer.ground_mesh,
                 texture_idx: renderer.checker_tex,
                 instances: ground_instances,
-            },
-            RenderInstanceBatch {
-                mesh: renderer.box_mesh,
-                texture_idx: renderer.white_tex,
-                instances: box_instances,
-            },
-        ];
+            });
+        }
+        batches.push(RenderInstanceBatch {
+            mesh: renderer.box_mesh,
+            texture_idx: renderer.white_tex,
+            instances: box_instances,
+        });
 
-        if let Some(water) = self.water_mesh {
+        if in_exterior && let Some(water) = self.water_mesh {
             batches.push(RenderInstanceBatch {
                 mesh: water,
                 texture_idx: renderer.white_tex,
@@ -1167,6 +1672,48 @@ impl GameWorldState {
 
         let decoded_radio_sample = self.audio.verify_first_radio_track_decodes();
 
+        let mut skinned_moved_verts = 0usize;
+        if let Some(img) = &self.gta3_archive
+            && let Ok(bytes) = img.read_entry("fam1.dff")
+            && let Ok(clump) = DffClump::parse(&bytes)
+            && !self.ped_ifp_lib.is_empty()
+            && let Some(skin) = clump.geometries.iter().find_map(|g| g.skin.as_ref())
+        {
+            let subs = CpuMeshData::dff_clump_submeshes(&clump);
+            let poses = self.ped_ifp_lib.sample_clip("walk_civi", 0.25, true);
+            let mats = compute_skin_matrices(&clump.frames, skin, &poses);
+            let mut out_verts = Vec::new();
+            for sub in &subs {
+                sub.compute_skinned_vertices(&mats, &mut out_verts);
+                for (a, b) in out_verts.iter().zip(&sub.cpu_mesh.vertices) {
+                    if Vec3::from_array(a.position).distance_squared(Vec3::from_array(b.position))
+                        > 1e-4
+                    {
+                        skinned_moved_verts += 1;
+                    }
+                }
+            }
+            anyhow::ensure!(
+                skinned_moved_verts > 0,
+                "fam1.dff ped.ifp skinning produced zero deformed vertices"
+            );
+        }
+
+        let carls_paired_interior = self
+            .world
+            .nearby_enex(Vec3::new(2495.33, -1690.75, 13.78), 0, 2.0)
+            .into_iter()
+            .next()
+            .and_then(|e| self.world.find_paired_enex(e, 0))
+            .map(|d| d.target_interior);
+        if !self.world.entry_exits.is_empty() {
+            anyhow::ensure!(
+                carls_paired_interior == Some(3),
+                "Expected CARLS paired ENEX interior 3, got {:?}",
+                carls_paired_interior
+            );
+        }
+
         info!(
             ticks = self.timestep.total_ticks,
             player_pos = ?self.player.position,
@@ -1175,6 +1722,10 @@ impl GameWorldState {
             handling_entries = self.handling.as_ref().map_or(0, |h| h.vehicles.len()),
             audio_stations = self.audio.available_radio_count(),
             audio_sfx_clips = self.audio.loaded_sfx_count(),
+            ifp_clips = self.ped_ifp_lib.clips.len(),
+            enex_portals = self.world.entry_exits.len(),
+            skinned_fam1_moved_verts = skinned_moved_verts,
+            carls_paired_interior = ?carls_paired_interior,
             decoded_radio = ?decoded_radio_sample,
             "Smoke test checks passed"
         );
@@ -1182,13 +1733,15 @@ impl GameWorldState {
     }
 }
 
-trait PlayerInteriorExt {
-    fn interior_zero(&self) -> i32;
-}
-
-impl PlayerInteriorExt for PlayerEntity {
-    fn interior_zero(&self) -> i32 {
-        0
+fn ped_model_name_for(model_id: u32) -> &'static str {
+    match model_id {
+        105 => "fam1",
+        106 => "fam2",
+        107 => "fam3",
+        21 => "bmydj",
+        280 => "lapd1",
+        9 | 14 => "hmost",
+        _ => "fam2",
     }
 }
 
@@ -1226,4 +1779,143 @@ fn sample_sa_car_color(idx: usize) -> [f32; 3] {
         [0.36, 0.16, 0.42], // Ballas Purple
     ];
     PALETTE[idx % PALETTE.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtasarust_gta_formats::ipl::IplEntryExit;
+
+    #[test]
+    fn enex_teleports_to_interior_and_triggers_services() {
+        let cfg = EngineConfig {
+            game_data_dir: None,
+            ..Default::default()
+        };
+        let mut host = HostInfo::detect();
+        host.save_dir = std::env::temp_dir().join("gtasarust_enex_test_saves");
+        let mut sim = GameWorldState::initialize(cfg, host, true);
+        sim.world.entry_exits = vec![
+            IplEntryExit {
+                entrance: [2495.33, -1690.75, 13.78],
+                entrance_rot: 0.0,
+                size: [1.4, 1.4, 8.0],
+                exit: [2495.33, -1690.25, 13.78],
+                exit_rot: 0.0,
+                target_interior: 0,
+                flags: 4,
+                name: "CARLS".into(),
+            },
+            IplEntryExit {
+                entrance: [2496.05, -1692.73, 1013.75],
+                entrance_rot: std::f32::consts::PI,
+                size: [2.0, 2.0, 8.0],
+                exit: [2496.05, -1692.93, 1013.75],
+                exit_rot: -180.0,
+                target_interior: 3,
+                flags: 0,
+                name: "CARLS".into(),
+            },
+            IplEntryExit {
+                entrance: [2419.95, -1509.8, 23.16],
+                entrance_rot: 0.0,
+                size: [1.5, 1.5, 8.0],
+                exit: [2419.95, -1511.5, 23.16],
+                exit_rot: 0.0,
+                target_interior: 0,
+                flags: 4,
+                name: "FDCHICK".into(),
+            },
+            IplEntryExit {
+                entrance: [365.67, -11.61, 1000.87],
+                entrance_rot: 0.0,
+                size: [2.0, 2.0, 8.0],
+                exit: [365.67, -9.8, 1000.87],
+                exit_rot: 0.0,
+                target_interior: 9,
+                flags: 0,
+                name: "FDCHICK".into(),
+            },
+            IplEntryExit {
+                entrance: [1368.35, -1279.06, 12.55],
+                entrance_rot: 0.0,
+                size: [1.5, 1.5, 8.0],
+                exit: [1368.35, -1281.0, 12.55],
+                exit_rot: 0.0,
+                target_interior: 0,
+                flags: 4,
+                name: "AMMUN1".into(),
+            },
+            IplEntryExit {
+                entrance: [286.15, -41.54, 1000.57],
+                entrance_rot: 0.0,
+                size: [2.0, 2.0, 8.0],
+                exit: [286.15, -39.5, 1000.57],
+                exit_rot: 0.0,
+                target_interior: 1,
+                flags: 0,
+                name: "AMMUN1".into(),
+            },
+        ];
+
+        // Enter Johnson House through CARLS ENEX
+        sim.player.position = Vec3::new(2495.33, -1690.75, 13.78);
+        sim.player.health = 45.0;
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.interior, 3);
+        assert!((sim.player.position.z - 1013.75).abs() < 1.0);
+
+        // Save roundtrip preserves interior = 3
+        let saved = sim.to_save_data(2);
+        assert_eq!(saved.interior, 3);
+
+        // Safehouse service counter restores health
+        let svc = sim.interior_service_pos.expect("CARLS service spot");
+        sim.player.position = svc;
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert!((sim.player.health - sim.player.max_health).abs() < 1e-3);
+
+        // Walk back to interior CARLS exit to return to grove street exterior
+        sim.enex_cooldown = 0.0;
+        sim.enex_lock_pos = None;
+        sim.player.position = Vec3::new(2496.05, -1692.73, 1013.75);
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.interior, 0);
+
+        // Enter Cluckin' Bell and buy food (-$10, +50 HP)
+        sim.enex_cooldown = 0.0;
+        sim.enex_lock_pos = None;
+        sim.player.position = Vec3::new(2419.95, -1509.8, 23.16);
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.interior, 9);
+        let fd_svc = sim.interior_service_pos.expect("FDCHICK service spot");
+        sim.player.health = 30.0;
+        sim.player.money = 100;
+        sim.service_cooldown = 0.0;
+        sim.player.position = fd_svc;
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.money, 90);
+        assert!((sim.player.health - 80.0).abs() < 1e-3);
+
+        // Exit Cluckin' Bell and enter Ammu-Nation to buy 9mm ammo (-$200, +50 reserve)
+        sim.enex_cooldown = 0.0;
+        sim.enex_lock_pos = None;
+        sim.player.interior = 0;
+        sim.player.position = Vec3::new(1368.35, -1279.06, 12.55);
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.interior, 1);
+        let am_svc = sim.interior_service_pos.expect("AMMUN1 service spot");
+        let before_ammo = sim.player.weapons.slots[2]
+            .as_ref()
+            .map_or(0, |w| w.reserve_ammo);
+        sim.player.money = 350;
+        sim.service_cooldown = 0.0;
+        sim.player.position = am_svc;
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        assert_eq!(sim.player.money, 150);
+        assert_eq!(
+            sim.player.weapons.slots[2].as_ref().unwrap().reserve_ammo,
+            before_ammo + 50
+        );
+    }
 }

@@ -389,12 +389,39 @@ impl SceneRenderer {
     }
 
     pub fn upload_mesh(&mut self, label: &str, cpu: &CpuMeshData) -> GpuMeshHandle {
+        self.upload_mesh_with_usage(label, cpu, wgpu::BufferUsages::VERTEX)
+    }
+
+    pub fn upload_dynamic_mesh(&mut self, label: &str, cpu: &CpuMeshData) -> GpuMeshHandle {
+        self.upload_mesh_with_usage(
+            label,
+            cpu,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        )
+    }
+
+    pub fn update_mesh_vertices(&self, handle: GpuMeshHandle, vertices: &[Vertex3D]) {
+        if let Some(gpu) = self.meshes.get(handle.0) {
+            let byte_len = std::mem::size_of_val(vertices) as u64;
+            if byte_len <= gpu.vertex_buffer.size() && !vertices.is_empty() {
+                self.queue
+                    .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(vertices));
+            }
+        }
+    }
+
+    fn upload_mesh_with_usage(
+        &mut self,
+        label: &str,
+        cpu: &CpuMeshData,
+        vertex_usage: wgpu::BufferUsages,
+    ) -> GpuMeshHandle {
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
                 contents: bytemuck::cast_slice(&cpu.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: vertex_usage,
             });
         let index_buffer = self
             .device

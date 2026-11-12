@@ -47,6 +47,8 @@ pub struct SaveGameData {
     pub game_day: u32,
     pub player_position: [f32; 3],
     pub player_yaw: f32,
+    #[serde(default)]
+    pub interior: i32,
     pub health: f32,
     pub max_health: f32,
     pub armor: f32,
@@ -71,6 +73,7 @@ impl Default for SaveGameData {
             // Grove Street cul-de-sac coordinates in Los Santos
             player_position: [2495.3, -1688.2, 13.5],
             player_yaw: 0.0,
+            interior: 0,
             health: 100.0,
             max_health: 100.0,
             armor: 0.0,

@@ -148,6 +148,7 @@ pub fn build_game_ui(
                     world,
                     missions,
                     radio_name,
+                    ui_state.status_message.as_deref(),
                     config.game.show_radar,
                 );
             }
@@ -207,6 +208,7 @@ fn draw_sa_hud(
     world: &WorldManager,
     missions: &MissionManager,
     radio_name: &str,
+    status_message: Option<&str>,
     show_radar: bool,
 ) {
     let rect = ctx.content_rect();
@@ -214,6 +216,22 @@ fn draw_sa_hud(
         egui::Order::Foreground,
         egui::Id::unique("sa_hud"),
     ));
+
+    if let Some(msg) = status_message {
+        let help_box = Rect::from_min_size(Pos2::new(26.0, 26.0), Vec2::new(360.0, 44.0));
+        painter.rect_filled(
+            help_box,
+            CornerRadius::same(4),
+            Color32::from_rgba_unmultiplied(8, 10, 14, 200),
+        );
+        painter.text(
+            help_box.left_center() + Vec2::new(12.0, 0.0),
+            Align2::LEFT_CENTER,
+            msg,
+            FontId::proportional(15.0),
+            Color32::from_rgb(238, 238, 238),
+        );
+    }
 
     // Top-right GTA:SA cluster: Weapon box + Clock + Money + Health + Armor + Wanted stars
     let right_x = rect.max.x - 28.0;
@@ -342,6 +360,21 @@ fn draw_sa_hud(
                     Pos2::new(center.x + rel.x, center.y - rel.y),
                     3.0,
                     Color32::from_rgb(130, 200, 255),
+                );
+            }
+        }
+        // Nearby ENEX doorways matching current interior
+        for e in &world.entry_exits {
+            if e.target_interior != player.interior {
+                continue;
+            }
+            let rel = (glam::Vec3::from_array(e.entrance) - player.position).truncate() * scale;
+            if rel.length() < radius - 8.0 {
+                let p = Pos2::new(center.x + rel.x, center.y - rel.y);
+                painter.rect_filled(
+                    Rect::from_center_size(p, Vec2::splat(5.0)),
+                    0.0,
+                    Color32::from_rgb(255, 210, 40),
                 );
             }
         }
@@ -607,10 +640,11 @@ fn draw_dev_inspector(
             ui.label(format!("FPS: {fps:.1} | Backend: {backend_name}"));
             ui.label(format!("Adapter: {adapter_name}"));
             ui.label(format!(
-                "Pos: ({:.1}, {:.1}, {:.1}) | Mode: {:?} | Anim: {:?}",
+                "Pos: ({:.1}, {:.1}, {:.1}) | Int: {} | Mode: {:?} | Anim: {:?}",
                 player.position.x,
                 player.position.y,
                 player.position.z,
+                player.interior,
                 player.control_mode,
                 player.anim.current
             ));

@@ -35,6 +35,8 @@ pub struct PlayerEntity {
     pub in_water: bool,
     pub control_mode: ControlMode,
     pub current_vehicle: Option<VehicleId>,
+    #[serde(default)]
+    pub interior: i32,
     pub life_state: PlayerLifeState,
     pub weapons: WeaponInventory,
     pub anim: AnimationController,
@@ -61,6 +63,7 @@ impl Default for PlayerEntity {
             in_water: false,
             control_mode: ControlMode::OnFoot,
             current_vehicle: None,
+            interior: 0,
             life_state: PlayerLifeState::Alive,
             weapons: WeaponInventory::default(),
             anim: AnimationController::default(),
@@ -218,6 +221,7 @@ impl PlayerEntity {
         self.money = (self.money - 100).max(0);
         self.control_mode = ControlMode::OnFoot;
         self.current_vehicle = None;
+        self.interior = 0;
         self.life_state = PlayerLifeState::Alive;
     }
 }
