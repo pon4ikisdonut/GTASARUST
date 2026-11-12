@@ -10,6 +10,7 @@ use gtasarust_gta_formats::{
     ide::{IdeFile, IdeObjectDef, IdePedDef, IdeVehicleDef},
     img::ImgArchive,
     ipl::{IplCarSpawn, IplEntryExit, IplFile, IplInstance, IplZoneBox},
+    paths::PathsFile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -69,6 +70,155 @@ pub struct WorldPlacement {
     pub interior: i32,
 }
 
+/// Directed navigation waypoint in San Andreas road/pedestrian path graph.
+#[derive(Debug, Clone)]
+pub struct WorldPathNode {
+    pub position: Vec3,
+    pub neighbors: Vec<(u16, u16)>,
+    pub is_ped: bool,
+    pub is_water: bool,
+    pub is_highway: bool,
+}
+
+/// Complete San Andreas vehicle & pedestrian navigation graph parsed from `NODES0.DAT`..`NODES63.DAT`.
+#[derive(Debug, Default)]
+pub struct PathGraph {
+    pub nodes: HashMap<(u16, u16), WorldPathNode>,
+    pub areas: HashMap<u16, Vec<(u16, u16)>>,
+    pub total_links: usize,
+}
+
+impl PathGraph {
+    pub fn area_xy(pos: Vec3) -> (i32, i32) {
+        let ax = ((pos.x + 3000.0) / 750.0).floor().clamp(0.0, 7.0) as i32;
+        let ay = ((pos.y + 3000.0) / 750.0).floor().clamp(0.0, 7.0) as i32;
+        (ax, ay)
+    }
+
+    pub fn insert_paths_file(&mut self, pf: PathsFile) {
+        for n in pf.nodes {
+            let start = n.link_start as usize;
+            let end = start
+                .saturating_add(n.link_count as usize)
+                .min(pf.links.len());
+            let mut neighbors = Vec::with_capacity(end.saturating_sub(start));
+            if start < end {
+                for l in &pf.links[start..end] {
+                    neighbors.push((l.target_area_id, l.target_node_id));
+                }
+            }
+            self.total_links += neighbors.len();
+            let key = (n.area_id, n.node_id);
+            self.nodes.insert(
+                key,
+                WorldPathNode {
+                    position: Vec3::from_array(n.position),
+                    neighbors,
+                    is_ped: n.is_ped,
+                    is_water: n.is_water,
+                    is_highway: n.is_highway,
+                },
+            );
+            self.areas.entry(n.area_id).or_default().push(key);
+        }
+    }
+
+    /// Collect candidate waypoint keys within `radius` around `pos` (filtering road vs sidewalk).
+    pub fn nodes_near(&self, pos: Vec3, radius: f32, want_ped: bool) -> Vec<(u16, u16)> {
+        let (cx, cy) = Self::area_xy(pos);
+        let r2 = radius * radius;
+        let mut out = Vec::new();
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let ax = cx + dx;
+                let ay = cy + dy;
+                if !(0..8).contains(&ax) || !(0..8).contains(&ay) {
+                    continue;
+                }
+                let area_id = (ay * 8 + ax) as u16;
+                if let Some(bucket) = self.areas.get(&area_id) {
+                    for &k in bucket {
+                        if let Some(node) = self.nodes.get(&k)
+                            && node.is_ped == want_ped
+                            && !node.is_water
+                            && node.position.truncate().distance_squared(pos.truncate()) <= r2
+                        {
+                            out.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Find the closest path node within `max_dist` of `pos`.
+    pub fn nearest_node(&self, pos: Vec3, want_ped: bool, max_dist: f32) -> Option<(u16, u16)> {
+        let (cx, cy) = Self::area_xy(pos);
+        let mut best_d2 = max_dist * max_dist;
+        let mut best = None;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let ax = cx + dx;
+                let ay = cy + dy;
+                if !(0..8).contains(&ax) || !(0..8).contains(&ay) {
+                    continue;
+                }
+                let area_id = (ay * 8 + ax) as u16;
+                if let Some(bucket) = self.areas.get(&area_id) {
+                    for &k in bucket {
+                        if let Some(node) = self.nodes.get(&k)
+                            && node.is_ped == want_ped
+                            && !node.is_water
+                        {
+                            let d2 = node.position.distance_squared(pos);
+                            if d2 < best_d2 {
+                                best_d2 = d2;
+                                best = Some(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Choose next connected waypoint matching `want_ped`, avoiding immediate U-turn `prev` when possible.
+    pub fn pick_next_node(
+        &self,
+        current: (u16, u16),
+        prev: Option<(u16, u16)>,
+        seed: u64,
+        want_ped: bool,
+    ) -> Option<(u16, u16)> {
+        let node = self.nodes.get(&current)?;
+        let mut forward: Vec<(u16, u16)> = Vec::new();
+        let mut fallback: Vec<(u16, u16)> = Vec::new();
+        for &nbr in &node.neighbors {
+            if let Some(target) = self.nodes.get(&nbr)
+                && target.is_ped == want_ped
+                && !target.is_water
+            {
+                if Some(nbr) != prev {
+                    forward.push(nbr);
+                } else {
+                    fallback.push(nbr);
+                }
+            }
+        }
+        let choices = if !forward.is_empty() {
+            &forward
+        } else {
+            &fallback
+        };
+        if choices.is_empty() {
+            return None;
+        }
+        Some(choices[(seed as usize) % choices.len()])
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WorldManager {
     pub objects: HashMap<u32, IdeObjectDef>,
@@ -83,6 +233,7 @@ pub struct WorldManager {
     pub timecyc: TimecycDat,
     pub weather: WeatherType,
     pub col_models: HashMap<String, ColModel>,
+    pub path_graph: PathGraph,
     pub loaded_from_original_data: bool,
 }
 
@@ -144,12 +295,15 @@ impl WorldManager {
             {
                 let mut ipl_entries = Vec::new();
                 let mut col_entries = Vec::new();
+                let mut node_entries = Vec::new();
                 for entry in img.entries() {
                     let lower = entry.name.to_ascii_lowercase();
                     if lower.ends_with(".ipl") {
                         ipl_entries.push(entry.clone());
                     } else if lower.ends_with(".col") {
                         col_entries.push(entry.clone());
+                    } else if lower.starts_with("nodes") && lower.ends_with(".dat") {
+                        node_entries.push(entry.clone());
                     }
                 }
                 for entry in ipl_entries {
@@ -167,6 +321,13 @@ impl WorldManager {
                         for model in parsed {
                             insert_col_model(&mut world.col_models, model);
                         }
+                    }
+                }
+                for entry in node_entries {
+                    if let Ok(bytes) = img.read_entry_data(&entry)
+                        && let Ok(pf) = PathsFile::parse_bytes(&bytes)
+                    {
+                        world.path_graph.insert_paths_file(pf);
                     }
                 }
             }
@@ -213,6 +374,8 @@ impl WorldManager {
             placements = world.total_placements(),
             car_spawns = world.car_spawns.len(),
             col_models = world.col_models.len(),
+            path_nodes = world.path_graph.nodes.len(),
+            path_links = world.path_graph.total_links,
             zones = world.zones.len(),
             water_quads = world.water_quads.len(),
             "World definitions loaded"
@@ -461,5 +624,50 @@ mod tests {
         world.update_streaming(grove, 300.0);
         assert!(world.active_placements(0).count() >= 1);
         assert_eq!(world.zone_name_at(grove), "Ganton");
+    }
+
+    #[test]
+    fn path_graph_picks_neighbors_without_immediate_uturn() {
+        let mut graph = PathGraph::default();
+        graph.nodes.insert(
+            (15, 0),
+            WorldPathNode {
+                position: Vec3::new(2480.0, -1668.0, 13.0),
+                neighbors: vec![(15, 1)],
+                is_ped: false,
+                is_water: false,
+                is_highway: false,
+            },
+        );
+        graph.nodes.insert(
+            (15, 1),
+            WorldPathNode {
+                position: Vec3::new(2500.0, -1668.0, 13.0),
+                neighbors: vec![(15, 0), (15, 2)],
+                is_ped: false,
+                is_water: false,
+                is_highway: false,
+            },
+        );
+        graph.nodes.insert(
+            (15, 2),
+            WorldPathNode {
+                position: Vec3::new(2520.0, -1668.0, 13.0),
+                neighbors: vec![(15, 1)],
+                is_ped: false,
+                is_water: false,
+                is_highway: false,
+            },
+        );
+        graph.areas.insert(15, vec![(15, 0), (15, 1), (15, 2)]);
+
+        assert_eq!(
+            graph.nearest_node(Vec3::new(2498.0, -1668.0, 13.0), false, 30.0),
+            Some((15, 1))
+        );
+        assert_eq!(
+            graph.pick_next_node((15, 1), Some((15, 0)), 42, false),
+            Some((15, 2))
+        );
     }
 }

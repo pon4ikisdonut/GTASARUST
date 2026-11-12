@@ -1456,8 +1456,11 @@ version = "0.1.0"
 dependencies = [
  "glam 0.34.3",
  "gtasarust-entities",
+ "gtasarust-gta-formats",
  "gtasarust-input",
+ "gtasarust-physics",
  "gtasarust-vehicles",
+ "gtasarust-world",
  "serde",
 ]
 

@@ -405,6 +405,21 @@ impl GameWorldState {
             return 0;
         }
         let mut pending: Vec<(f32, String, String)> = Vec::new();
+        for v in &self.vehicles.vehicles {
+            let def = self.world.vehicles.get(&v.model_id);
+            let model_lower = def
+                .map(|d| d.model_name.to_ascii_lowercase())
+                .unwrap_or_else(|| v.name.to_ascii_lowercase());
+            let dff_name = format!("{model_lower}.dff");
+            if !self.cached_dff_meshes.contains_key(&dff_name)
+                && !self.failed_dff_lookups.contains(&dff_name)
+            {
+                let txd_lower = def
+                    .map(|d| d.txd_name.to_ascii_lowercase())
+                    .unwrap_or_else(|| model_lower.clone());
+                pending.push((0.0, model_lower, txd_lower));
+            }
+        }
         for p in self.world.active_placements(self.player.interior_zero()) {
             if p.is_lod {
                 continue;
@@ -701,7 +716,13 @@ impl GameWorldState {
         self.audio.apply_config(&self.config.audio);
 
         if actions.enter_exit_just_pressed {
-            self.vehicles.toggle_player_entry(&mut self.player);
+            let was_on_foot = self.player.control_mode == ControlMode::OnFoot;
+            if self.vehicles.toggle_player_entry(&mut self.player)
+                && was_on_foot
+                && let Some(vid) = self.player.current_vehicle
+            {
+                self.ai.on_vehicle_entered(vid, &mut self.player);
+            }
         }
 
         if actions.radio_next && self.player.control_mode == ControlMode::InVehicle {
@@ -735,10 +756,20 @@ impl GameWorldState {
 
         let occupied_id = self.player.current_vehicle;
         for veh in &mut self.vehicles.vehicles {
+            let ai_action = if Some(veh.id) == occupied_id {
+                None
+            } else {
+                self.ai.traffic_action_for(
+                    veh,
+                    self.player.position,
+                    &self.physics,
+                    &self.world.path_graph,
+                )
+            };
             let input_for_veh = if Some(veh.id) == occupied_id {
                 Some(actions)
             } else {
-                None
+                ai_action.as_ref()
             };
             veh.step_physics(dt, input_for_veh, &self.physics);
             if Some(veh.id) == occupied_id {
@@ -748,7 +779,14 @@ impl GameWorldState {
         }
 
         self.physics.step(dt);
-        self.ai.tick(dt, &mut self.player, &mut self.vehicles);
+        self.ai.tick_world(
+            dt,
+            &mut self.player,
+            &mut self.vehicles,
+            self.handling.as_ref(),
+            &self.physics,
+            &self.world.path_graph,
+        );
         self.scm.tick(dt);
         self.missions.tick(dt, &mut self.player, &mut self.scm);
 

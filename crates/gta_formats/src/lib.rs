@@ -12,6 +12,7 @@ pub mod ide;
 pub mod ifp;
 pub mod img;
 pub mod ipl;
+pub mod paths;
 pub mod reader;
 pub mod rw;
 pub mod scm;

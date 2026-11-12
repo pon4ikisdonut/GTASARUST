@@ -18,10 +18,10 @@ Tracks feature parity between the original *Grand Theft Auto: San Andreas* (PC v
 | **Engine & Graphics** | LOD system, frustum culling, GPU instancing, sector streaming | In progress (frustum culling + instancing + sector grid active) | `gtasarust-renderer`, `gtasarust-world` |
 | **Engine & Graphics** | Water rendering & reflections | In progress (`301` `water.dat` quads uploaded and rendered via GPU mesh; reflections/buoyancy pending) | `gtasarust-renderer`, `gtasarust-world` |
 | **World** | Los Santos, San Fierro, Las Venturas, Countryside & Desert | In progress (placements & zones loaded across full map) | `gtasarust-world` |
-| **World** | Road/ped path nodes (`NODES*.DAT`), interiors, railways | Planned | `gtasarust-world` |
+| **World** | Road/ped path nodes (`NODES*.DAT`), interiors, railways | In progress (all 64 `NODES*.DAT` files parsed: `68,237` nodes / `143,622` links driving sidewalk peds & ambient traffic; interiors pending) | `gtasarust-gta-formats`, `gtasarust-world`, `gtasarust-ai` |
 | **Player** | Third-person movement (walk/run/sprint/jump/crouch/swim/climb) | In progress (walk/sprint/jump/crouch physics & camera implemented) | `gtasarust-entities`, `gtasarust-animation` |
 | **Vehicles** | Cars, bikes, BMX, boats, planes, helicopters, trains, emergency | In progress (`handling.cfg` driven entry/exit & basic physics) | `gtasarust-vehicles`, `gtasarust-physics` |
-| **AI & Law** | Pedestrian AI, traffic AI, 6-star police & wanted system | In progress (wanted escalation, gunshot panic, police pursuit) | `gtasarust-ai` |
+| **AI & Law** | Pedestrian AI, traffic AI, 6-star police & wanted system | In progress (`NODES*.DAT` traffic driving/yielding & sidewalk peds, carjacking crime/panic, police pursuit) | `gtasarust-ai` |
 | **Gameplay** | Health, armor, money, stamina, respect, weapons, shops, garages | In progress (health/armor, Colt .45 inventory/firing, wanted loop) | `gtasarust-entities`, `gtasarust-weapons` |
 | **Story** | Complete campaign missions, cutscenes, side activities | In progress (checkpoint campaign framework) | `gtasarust-missions`, `gtasarust-scripting` |
 | **Audio** | SFX banks, vehicle engines, footsteps, radio stations, volume mixer | In progress (`kira` mixer initialized; Vorbis/SFX stream decoding pending) | `gtasarust-audio` |
