@@ -4,48 +4,43 @@
 
 ---
 
-## 1. Current Verified State (Post-Commit E Baseline)
+## 1. Current Verified State (Milestone F1+F2 Baseline)
 
 - **Repository**: `E:\prjects\GTASARUST` (`https://github.com/pon4ikisdonut/GTASARUST.git`, branch `main`)
-- **Last Completed Milestone**: **Milestone E — `ped.ifp` Skeletal Animation, Articulated CJ/Ped Rendering & `ENEX` Interiors**
+- **Last Completed Milestone**: **Milestone F1+F2 — Authentic SA Rendering/Lighting, Modular `player.img` CJ, 4-Wheel Vehicle Rigs, Real `hud.txd`/`LOADSCS.TXD`/`radar00..143` UI & `main.scm` Chunk/Bytecode VM**
 - **Previous Verified Commits on `main`**:
   - `dd47d1d` — Initial verified 24-crate Rust workspace on Windows + Linux x86_64
   - `7d5e8c9` — **Milestone A**: Textured RenderWare DFF/TXD per-submesh rendering, `DffFrame` hierarchy, alternating tristrip winding parity, vehicle paint tinting, `water.dat` 301-quad mesh, sector asset streaming (`BUG-005` fixed)
   - `5e19b6e` — **Milestone B**: `.col` collision streaming (`10,160` models / `25,041` active `rapier3d` colliders at Grove Street), on-foot wall sliding & spawn grounding (`Z=12.712m`), vehicle crash damage, binary `bnry` IPL `cars_offset` fix at `0x3C` (`1,043` `CARS`), parked traffic (`BUG-004`, `BUG-006` fixed)
   - `3f5c0f5` — **Milestone C**: All 64 `NODES*.DAT` road/ped path graphs (`68,237` nodes / `143,622` links) driving sidewalk pedestrians, moving ambient road vehicles w/ obstacle yielding, and carjacking crime/panic
   - `3f4a1e0` — **Milestone D**: Real `audio/streams` XOR-unscrambled Ogg Vorbis radio (`264` tracks across `7` stations) & `audio/SFX` 16-bit PCM bank playback (`10` clips from `FEET`/`GENRL`) via `kira 0.12.6`, plus `AGENTS.md` / `CONTINUE.md`
-  - **Milestone E (current commit)**:
-    - `crates/gta_formats/src/{ifp.rs,rw.rs,ipl.rs}`: Full `ANP3` `ped.ifp` bone keyframe decoder (`IfpArchive::parse_full`, `i16/4096.0` non-conjugated quaternions & `i16/1024.0` root translations at `t/60.0`), `RW_SKIN_PLG` (`0x0116`) bone weights/indices/`inv_bind_matrices` & `RW_HANIM_PLG` (`0x011E`) node mappings w/ `RW_EXTENSION` frame-index fix (`BUG-007`), and `ENEX` off-by-one field fix (`fields[7..14]`, `BUG-008`)
-    - `crates/animation/src/lib.rs`: `IfpPoseLibrary`, `AnimationController::sample_poses`, and hierarchical `compute_skin_matrices` evaluator across `294` `ped.ifp` clips
-    - `crates/renderer/src/{mesh.rs,renderer.rs}`: `SkinnedVertexWeights`, `DffSubMesh::compute_skinned_vertices`, `CpuMeshData::marker_cone`, dynamic `BufferUsages::VERTEX | BufferUsages::COPY_DST` GPU mesh creation (`upload_dynamic_mesh`) and per-frame updates (`update_mesh_vertices`)
-    - `crates/world/src/lib.rs`, `crates/entities/src/lib.rs`, `crates/save_system/src/lib.rs`, `crates/ui/src/lib.rs`, `crates/game/src/simulation.rs`: `gta_int.img` binary IPL loading (`50,935` total placements across `1,457` sectors, `376` `ENEX` portals), dynamic CPU-skinned CJ (`fam1`, `1011` verts moved under `walk_civi`) and NPCs (`fam2`/`fam3`/`bmydj`/`lapd1`/`hmost`), floating yellow `ENEX` marker cones + radar doorway blips + help toast HUD, bidirectional interior transitions w/ `.col` collider rebuild & floor guard, and interactive Johnson House (`CARLS` safehouse heal+auto-save), Cluckin' Bell (`FDCHICK` `-$10, +50 HP`), and Ammu-Nation (`AMMUN*` `-$200, +50` 9mm reserve) counters
-    - Verified across **Windows 10/11 x86_64** (`fmt`, `clippy -- -D warnings`, `cargo test --workspace`, `--release` build, `--smoke-test --game-dir E:\gtasa`, 4s Vulkan Radeon RX 480 launch) and **WSL2 Ubuntu 22.04 x86_64** (`linux_verify.sh`: `fmt`, `clippy`, `test`, `release`, headless smoke, `gtasarust-map-inspector`)
+  - `282c342` — **Milestone E**: Full `ANP3` `ped.ifp` decoder (`294` clips), `SkinPLG`/`HAnim` CPU skinning (`fam1`, `1,011` verts deformed), `gta_int.img` binary IPLs (`50,935` placements / `376` `ENEX` portals), safehouse & Cluckin' Bell / Ammu-Nation counters (`BUG-007`, `BUG-008` fixed)
+  - **Milestone F1+F2 (current commit)**:
+    - **Visuals, Lighting & World (`assets/shaders/{world,sky}.wgsl`, `crates/{gta_formats,world,renderer}`)**: Fixed double-sRGB darkening (`Rgba8Unorm` texture upload + full 2x2 mipmap pyramid + sRGB gamma output on `Bgra8Unorm`), `ExtraVertColour` (`0x0253F2F9`) night prelit buffer + `timecyc.dat` ambient/ambient_obj/water/`dn_balance` interpolation, `DXT1` `FORMAT_565` opaque decoding + 8-bit luminance + `merge_rgba_alpha_mask`, `txdp` parent TXD chains across IDEs/`txd.ide`, 3-pass rendering (`world_pipeline`, `world_double_sided_pipeline`, `world_blend_pipeline`), `IDE_FLAG_*` cutout/glass/backface routing, `is_active_at_hour` building schedules, skyline LOD switching outside detail cap, `bounding_radius` frustum culling, omitted fallback ground quad when real map loaded, `water_mesh` rendered in transparent unlit pass
+    - **Player, Camera & Vehicles (`crates/{entities,vehicles,renderer,game}`)**: Decoupled third-person camera orbit (`camera_yaw`/`camera_pitch`/`camera_distance` + mouse wheel zoom + `CursorGrabMode::Locked`/`Confined` pointer lock), `.col` raycast camera anti-clipping (`update_third_person_collided`), camera-relative locomotion & aiming yaw, modular skinned CJ loaded directly from `models/player.img` (`head`, `vest`, `jeans`, `sneaker`, `hands` animated by `ped.ifp`), `CpuMeshData::dff_vehicle_parts` separating vehicle body + `wheel` + 4 `wheel_*_dummy` mounts w/ steering, rolling, left/right flip, and 4-point `.col` pitch/roll alignment
+    - **Retail HUD/Radar & `main.scm` VM (`crates/{gta_formats,scripting,ui,game}`)**: `LOADSCS.TXD` (`loadsc0`) splash screen + `"RESUME FREE ROAM"`, `models/hud.txd` (`69` sprites incl. `fist`, `radardisc`, `radar_north`, `radar_centre`, `radar_sweet`, `radar_cj`), `144` retail `radar00..radar143.txd` minimap & fullscreen textured `Map` view; full `ScmImage` chunk parser (`'s'`, `0..=4`) + 699 SA opcode descriptors (`scm_opcodes.rs`) derived from `D:\gta-reversed` & `ScmVm` multi-thread bytecode execution emitting `ScmWorldCommand` (`SetTimeOfDay`, `ForceWeather`, `CreateCar`, `CreatePickup`, `AddBlip`, `PrintText`, etc.)
+    - Verified across **Windows 10/11 x86_64** (`46` workspace tests pass, `clippy -D warnings`, `--smoke-test`, 6s live Vulkan RX 480 launch: `main_offset=55976`, `hud_sprites=69`, `radar_tiles=144`, `parts=5` CJ, `models=350`, `vehicles=7`, `textures=3008`) and **WSL2 Ubuntu x86_64** (`fmt`, `clippy`, `46` workspace tests pass, release build, headless smoke, `gtasarust-map-inspector`)
 
-- **Open Blockers**: None (`BUG-001`..`BUG-008` all resolved in `BUGS.md`).
-
----
-
-## 2. Current Next Task — Milestone F: `main.scm` Bytecode VM & Grove Street Story Missions
-
-Implement Milestone F in order, integrating everything into `gtasarust`:
-
-1. **`crates/gta_formats` + `crates/scripting/src/lib.rs` (Real `main.scm` Bytecode Execution)**:
-   - Parse `main.scm` header tables (global variables space, object/model name table, mission offset table, MAIN section bytecode stream) and support multi-thread execution (`CREATE_THREAD` `004F`, `WAIT` `0001`, `GOTO` `0002`, `GOSUB`/`RETURN`, `TERMINATE_THIS_THREAD` `004E`, arithmetic & comparison opcodes, conditional jumps `004D` `JF`/`IF`).
-   - Dispatch core gameplay opcodes to engine state via host callbacks/commands: player spawn/freeze, actor/ped/vehicle spawn (`009A`, `00A5`), blip/sphere checkpoints, `00BA`/`00BC` GXT text-key big/subtitle banners, money/respect rewards (`0109`), and mission start/pass/fail progression.
-2. **Playable Early Grove Street Campaign Integration (`crates/missions/src/lib.rs`, `crates/game/src/simulation.rs`)**:
-   - Wire *In the Beginning*, *Big Smoke*, *Ryder*, *Tagging Up Turf*, and *Cleaning the Hood* cleanly into the world/HUD/save loop so starting at Grove Street triggers real GXT objectives, spawns quest NPCs/vehicles (Sweet's Greenwood, Ryder's Picador, BMX chase/spray tags/Ballas confrontation), reacts to player health/vehicle/weapon state, awards money/respect, unlocks next missions, and persists `completed_missions` cleanly through save slots (`slot 1..8`).
-   - Add automated mission/SCM integration & unit tests in `gtasarust-scripting`, `gtasarust-missions`, and `tests/gameplay/gameplay_integration.rs`.
-3. **Verify & Ship Milestone F**:
-   - Run full Windows verification + WSL2 Linux verification (`linux_verify.sh`).
-   - Update `CONTINUE.md` (advance Next Task to Milestone G), `DEVELOPMENT_STATUS.md`, `FEATURE_MATRIX.md`, `CHANGELOG.md`.
-   - `git commit` & `git push origin main`.
+- **Open Blockers**: None (`BUG-001`..`BUG-012` resolved in `BUGS.md`).
 
 ---
 
-## 3. Subsequent Roadmap (After Milestone F)
+## 2. Current Next Task — Milestone G: Story Campaign Execution, Cutscenes & Full Gameplay Systems
 
-- **Milestone G — Full San Andreas World Completeness & Systems**:
-  - Vehicle classes (motorcycles/BMX lean, boats + water buoyancy on `water.dat`, helicopters/planes rotor & lift), vehicle weapons/drive-by, police roadblocks/helicopters at 3–6 stars, mod garages / Pay 'n' Spray, gang warfare zones, and full Los Santos -> San Fierro -> Las Venturas mission arc progression.
+1. **Extend `main.scm` Opcode Dispatch & Cutscene / Mission Scripting (`crates/scripting`, `crates/missions`, `crates/game`)**:
+   - Wire additional high-frequency SA script opcodes (actors, vehicles, mission cleanup, garage/shop scripts, camera fades/scripted cams, `LOAD_AND_LAUNCH_MISSION_INTERNAL` streaming into *In the Beginning*, *Big Smoke*, *Ryder*, *Tagging Up Turf*, *Cleaning the Hood* end-to-end).
+   - Add cutscene `.cut`/text playback and synchronized scripted actor paths.
+2. **Deepen Gameplay Systems (`crates/vehicles`, `crates/ai`, `crates/weapons`, `crates/audio`)**:
+   - Motorbike/BMX lean, boat water buoyancy on `water.dat`, helicopter/plane flight lift & rotor spin, weapon aiming reticle (`siteM16`) & ped hit reactions, Pay 'n' Spray / Mod Garages, gang territory wars, and engine/siren audio synthesis.
+3. **Verify & Ship Milestone G**:
+   - Maintain full Windows x86_64 + WSL2 Linux x86_64 parity (`cargo fmt`, `clippy -- -D warnings`, `cargo test`, `--smoke-test`, live Vulkan launch), keep documentation synchronized, and push regularly to `main`.
+
+---
+
+## 3. Subsequent Roadmap (After Milestone G)
+
+- **Milestone H — Full Story Arc, Audio Streams & Polish**:
+  - Complete Los Santos -> San Fierro -> Las Venturas mission chains, radio DJ/commercial banter, ped speech banks, full indoor activities, and PC retail config/performance polish.
 
 ---
 

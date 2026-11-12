@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Item definition bitflags (`eItemDefinitionFlags`) from GTA: San Andreas `.ide` files.
+pub const IDE_FLAG_IS_ROAD: u32 = 0x0000_0001;
+pub const IDE_FLAG_DRAW_LAST: u32 = 0x0000_0004;
+pub const IDE_FLAG_ADDITIVE: u32 = 0x0000_0008;
+pub const IDE_FLAG_NO_ZWRITE: u32 = 0x0000_0040;
+pub const IDE_FLAG_DONT_RECEIVE_SHADOWS: u32 = 0x0000_0080;
+pub const IDE_FLAG_IS_GLASS_TYPE_1: u32 = 0x0000_0200;
+pub const IDE_FLAG_IS_GLASS_TYPE_2: u32 = 0x0000_0400;
+pub const IDE_FLAG_IS_GARAGE_DOOR: u32 = 0x0000_0800;
+pub const IDE_FLAG_IS_DAMAGEABLE: u32 = 0x0000_1000;
+pub const IDE_FLAG_IS_TREE: u32 = 0x0000_2000;
+pub const IDE_FLAG_IS_PALM: u32 = 0x0000_4000;
+pub const IDE_FLAG_DISABLE_BACKFACE_CULLING: u32 = 0x0020_0000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdeObjectDef {
     pub id: u32,

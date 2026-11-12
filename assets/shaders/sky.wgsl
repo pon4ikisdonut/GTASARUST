@@ -39,6 +39,9 @@ fn fs_sky(in: VsOut) -> @location(0) vec4<f32> {
     // Z-up: horizon is dir.z == 0, zenith is dir.z == 1
     let t = clamp(dir.z * 0.85 + 0.15, 0.0, 1.0);
     var col = mix(sky.sky_bottom.rgb, sky.sky_top.rgb, pow(t, 0.65));
+    // Below horizon: smooth blend toward distant SA sea/ground haze
+    let below = clamp(-dir.z * 3.0, 0.0, 1.0);
+    col = mix(col, sky.sky_bottom.rgb * vec3<f32>(0.55, 0.62, 0.68), below);
 
     // Subtle San Andreas sun halo
     let sun_dot = max(dot(dir, normalize(sky.sun_dir.xyz)), 0.0);

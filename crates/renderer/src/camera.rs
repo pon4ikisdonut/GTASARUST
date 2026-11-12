@@ -26,18 +26,34 @@ impl Default for CameraState {
 
 impl CameraState {
     pub fn update_third_person(&mut self, target_pos: Vec3, yaw: f32, pitch: f32, distance: f32) {
-        let look_target = target_pos + Vec3::new(0.0, 0.0, 1.4);
+        self.update_third_person_collided(target_pos, yaw, pitch, distance, None);
+    }
+
+    /// Update third-person orbit camera and pull forward cleanly if a `.col` ray hits a wall/ground.
+    pub fn update_third_person_collided(
+        &mut self,
+        target_pos: Vec3,
+        yaw: f32,
+        pitch: f32,
+        distance: f32,
+        ray_hit: Option<&dyn Fn(Vec3, Vec3, f32) -> Option<f32>>,
+    ) {
+        let look_target = target_pos + Vec3::new(0.0, 0.0, 1.35);
         let dir = Vec3::new(
             yaw.cos() * pitch.cos(),
             yaw.sin() * pitch.cos(),
             pitch.sin(),
         )
         .normalize();
-        self.target = look_target;
-        self.position = look_target - dir * distance;
-        if self.position.z < 0.4 {
-            self.position.z = 0.4;
+        let cam_ray_dir = -dir;
+        let mut effective_dist = distance.clamp(1.6, 12.0);
+        if let Some(probe) = ray_hit
+            && let Some(hit_dist) = probe(look_target, cam_ray_dir, effective_dist + 0.35)
+        {
+            effective_dist = (hit_dist - 0.35).clamp(0.75, effective_dist);
         }
+        self.target = look_target;
+        self.position = look_target + cam_ray_dir * effective_dist;
     }
 
     pub fn view_matrix(&self) -> Mat4 {
@@ -111,5 +127,17 @@ mod tests {
         let frustum = cam.frustum();
         assert!(frustum.intersects_sphere(Vec3::new(100.0, 0.0, 1.0), 1.0));
         assert!(!frustum.intersects_sphere(Vec3::new(50.0, 0.0, 1.0), 1.0));
+    }
+
+    #[test]
+    fn collided_camera_pulls_closer_when_ray_hits_obstacle() {
+        let mut cam = CameraState::default();
+        let hit_wall = |_orig: Vec3, _dir: Vec3, _max: f32| Some(2.0_f32);
+        cam.update_third_person_collided(Vec3::ZERO, 0.0, 0.0, 8.0, Some(&hit_wall));
+        let dist = cam.position.distance(cam.target);
+        assert!(
+            (dist - 1.65).abs() < 1e-3,
+            "Expected collided distance ~1.65, got {dist}"
+        );
     }
 }

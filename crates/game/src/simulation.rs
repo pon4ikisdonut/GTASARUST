@@ -8,9 +8,15 @@ use gtasarust_entities::{PlayerEntity, PlayerLifeState};
 use gtasarust_gta_formats::{
     dat::HandlingCfg,
     gxt::GxtArchive,
+    ide::{
+        IDE_FLAG_ADDITIVE, IDE_FLAG_DISABLE_BACKFACE_CULLING, IDE_FLAG_DRAW_LAST,
+        IDE_FLAG_IS_GLASS_TYPE_1, IDE_FLAG_IS_GLASS_TYPE_2, IDE_FLAG_IS_PALM, IDE_FLAG_IS_TREE,
+        IDE_FLAG_NO_ZWRITE,
+    },
     ifp::IfpArchive,
     img::ImgArchive,
-    rw::{DffClump, DffFrame, DffSkin, TxdArchive},
+    rw::{DffClump, DffFrame, DffSkin, TxdArchive, merge_rgba_alpha_mask},
+    scm::ScmImage,
 };
 use gtasarust_input::{ActionFrameState, ControlMode, InputManager};
 use gtasarust_localization::LocalizationTable;
@@ -18,27 +24,36 @@ use gtasarust_missions::MissionManager;
 use gtasarust_physics::{ColliderHandle, PhysicsWorld};
 use gtasarust_renderer::{
     CameraState, DffSubMesh, GpuMeshHandle, InstanceData, RenderInstanceBatch, SceneRenderer,
-    Vertex3D, mesh::CpuMeshData,
+    VehicleWheelMount, Vertex3D, mesh::CpuMeshData,
 };
 use gtasarust_save_system::{SaveGameData, SavedWeaponSlot, read_save_slot, write_save_slot};
-use gtasarust_scripting::ScmVm;
+use gtasarust_scripting::{ScmVm, ScmWorldCommand};
 use gtasarust_ui::{GameUiState, ScreenState, UiActionQueue};
 use gtasarust_vehicles::{VehicleClass, VehicleManager, VehicleSpawnSpec};
 use gtasarust_weapons::{WeaponInventory, WeaponKind};
-use gtasarust_world::{SectorCoord, WorldManager};
+use gtasarust_world::{SectorCoord, WeatherType, WorldManager};
 use std::collections::{HashMap, HashSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct CachedSubMesh {
     pub mesh: GpuMeshHandle,
     pub texture_idx: usize,
     pub material_color: [f32; 4],
+    pub has_alpha_tex: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct CachedDffModel {
     pub submeshes: Vec<CachedSubMesh>,
+    pub bounding_radius: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedVehicleModel {
+    pub body: Vec<CachedSubMesh>,
+    pub wheel: Vec<CachedSubMesh>,
+    pub wheel_mounts: Vec<VehicleWheelMount>,
     pub min_z: f32,
 }
 
@@ -52,6 +67,11 @@ pub struct CachedSkinnedPedRig {
     pub frames: Vec<DffFrame>,
     pub skin: Option<DffSkin>,
     pub submeshes: Vec<SkinnedSubMeshTemplate>,
+}
+
+pub struct CachedCjPart {
+    pub rig: CachedSkinnedPedRig,
+    pub mesh_handles: Vec<(GpuMeshHandle, usize, [f32; 4])>,
 }
 
 pub struct GameWorldState {
@@ -75,12 +95,17 @@ pub struct GameWorldState {
     pub vfs: Option<GameDataRoot>,
     pub gta3_archive: Option<ImgArchive>,
     pub gta_int_archive: Option<ImgArchive>,
+    pub player_archive: Option<ImgArchive>,
     pub handling: Option<HandlingCfg>,
     pub ped_ifp_lib: IfpPoseLibrary,
     pub cached_textures: HashMap<String, usize>,
+    pub txd_first_tex: HashMap<String, usize>,
+    pub alpha_textures: HashSet<usize>,
     pub loaded_txds: HashSet<String>,
     pub cached_dff_meshes: HashMap<String, CachedDffModel>,
+    pub cached_vehicle_models: HashMap<String, CachedVehicleModel>,
     pub ped_rigs: HashMap<String, CachedSkinnedPedRig>,
+    pub cj_parts: Vec<CachedCjPart>,
     pub cj_skinned_meshes: Vec<(GpuMeshHandle, usize, [f32; 4])>,
     pub ped_skinned_meshes: HashMap<u64, (String, Vec<GpuMeshHandle>)>,
     skin_vertex_scratch: Vec<Vertex3D>,
@@ -89,6 +114,8 @@ pub struct GameWorldState {
     pub loaded_collider_interior: i32,
     pub water_mesh: Option<GpuMeshHandle>,
     pub marker_mesh: Option<GpuMeshHandle>,
+    pub scm_pickups: Vec<(Vec3, i32)>,
+    pub scm_blips: Vec<(Vec3, u8)>,
     pub enex_cooldown: f32,
     pub enex_lock_pos: Option<Vec3>,
     pub interior_floor_z: Option<f32>,
@@ -105,9 +132,19 @@ impl GameWorldState {
         ));
         let mut gta3_archive = None;
         let mut gta_int_archive = None;
+        let mut player_archive = None;
         let mut handling = None;
         let mut opened_vfs = None;
         let mut ped_ifp_lib = IfpPoseLibrary::default();
+        let mut scm = ScmVm::default();
+        let mut ui_state = GameUiState {
+            screen: if headless {
+                ScreenState::Playing
+            } else {
+                ScreenState::MainMenu
+            },
+            ..Default::default()
+        };
 
         let world = if let Some(dir) = &config.game_data_dir {
             match GameDataRoot::open(dir) {
@@ -129,11 +166,28 @@ impl GameWorldState {
                         let clips = ped_ifp_lib.insert_archive(archive);
                         info!(clips, "Loaded ped.ifp skeletal animation clips");
                     }
+                    if let Ok(scm_bytes) = vfs.read_bytes("data/script/main.scm")
+                        && let Ok(scm_img) = ScmImage::parse(scm_bytes)
+                    {
+                        info!(
+                            main_offset = scm_img.main_offset,
+                            globals_bytes = scm_img.globals_end,
+                            missions = scm_img.mission_offsets.len(),
+                            "Loaded retail GTA:SA main.scm bytecode image"
+                        );
+                        scm.load_scm_image(scm_img);
+                    }
                     if let Ok(img_path) = vfs.resolve("models/gta3.img") {
                         gta3_archive = ImgArchive::open(&img_path).ok();
                     }
                     if let Ok(img_path) = vfs.resolve("models/gta_int.img") {
                         gta_int_archive = ImgArchive::open(&img_path).ok();
+                    }
+                    if let Ok(img_path) = vfs.resolve("models/player.img") {
+                        player_archive = ImgArchive::open(&img_path).ok();
+                    }
+                    if !headless {
+                        load_ui_media(&vfs, gta3_archive.as_ref(), &mut ui_state);
                     }
                     let loaded_world = WorldManager::load_from_game_dir(&vfs, !headless);
                     opened_vfs = Some(vfs);
@@ -223,21 +277,26 @@ impl GameWorldState {
             player,
             vehicles,
             ai,
-            scm: ScmVm::default(),
+            scm,
             missions: MissionManager::new_san_andreas_campaign(),
             localization,
             camera,
-            ui_state: GameUiState::default(),
+            ui_state,
             quit_requested: false,
             vfs: opened_vfs,
             gta3_archive,
             gta_int_archive,
+            player_archive,
             handling,
             ped_ifp_lib,
             cached_textures: HashMap::new(),
+            txd_first_tex: HashMap::new(),
+            alpha_textures: HashSet::new(),
             loaded_txds: HashSet::new(),
             cached_dff_meshes: HashMap::new(),
+            cached_vehicle_models: HashMap::new(),
             ped_rigs: HashMap::new(),
+            cj_parts: Vec::new(),
             cj_skinned_meshes: Vec::new(),
             ped_skinned_meshes: HashMap::new(),
             skin_vertex_scratch: Vec::new(),
@@ -246,6 +305,8 @@ impl GameWorldState {
             loaded_collider_interior: 0,
             water_mesh: None,
             marker_mesh: None,
+            scm_pickups: Vec::new(),
+            scm_blips: Vec::new(),
             enex_cooldown: 0.0,
             enex_lock_pos: None,
             interior_floor_z: None,
@@ -254,6 +315,7 @@ impl GameWorldState {
             service_cooldown: 0.0,
             status_message_timer: 0.0,
         };
+        state.drain_scm_world_commands();
         if state.world.loaded_from_original_data {
             state.spawn_nearby_ipl_vehicles(260.0, 20);
         }
@@ -262,13 +324,104 @@ impl GameWorldState {
             .update_streaming(state.player.position, state.config.graphics.draw_distance);
         state.sync_collision_sectors();
         state.snap_initial_spawns_to_ground();
-        state.camera.update_third_person(
-            state.player.position,
-            state.player.yaw,
-            state.player.pitch,
-            6.5,
-        );
+        state.update_player_camera();
         state
+    }
+
+    fn update_player_camera(&mut self) {
+        let dist = if self.player.control_mode == ControlMode::InVehicle {
+            (self.player.camera_distance + 2.5).clamp(4.0, 14.0)
+        } else {
+            self.player.camera_distance.clamp(2.2, 12.0)
+        };
+        let physics = &self.physics;
+        let ray_probe = |origin: Vec3, dir: Vec3, max_d: f32| {
+            physics.raycast(origin, dir, max_d).map(|(toi, _)| toi)
+        };
+        self.camera.update_third_person_collided(
+            self.player.position,
+            self.player.camera_yaw,
+            self.player.camera_pitch,
+            dist,
+            Some(&ray_probe),
+        );
+    }
+
+    fn drain_scm_world_commands(&mut self) {
+        let cmds = std::mem::take(&mut self.scm.world_commands);
+        for cmd in cmds {
+            match cmd {
+                ScmWorldCommand::SetTimeOfDay { hour, minute } => {
+                    self.clock.hour = hour % 24;
+                    self.clock.minute = minute % 60;
+                }
+                ScmWorldCommand::ForceWeather(id) => {
+                    self.world.weather = weather_from_sa_id(id);
+                }
+                ScmWorldCommand::CreateCar { model_id, pos, .. } => {
+                    let p = Vec3::from_array(pos);
+                    if self.vehicles.vehicles.len() < 48
+                        && p.length_squared() > 1.0
+                        && !self
+                            .vehicles
+                            .vehicles
+                            .iter()
+                            .any(|v| v.position.truncate().distance_squared(p.truncate()) < 16.0)
+                        && let Some(def) = self.world.vehicles.get(&(model_id as u32))
+                    {
+                        self.vehicles.spawn(VehicleSpawnSpec {
+                            model_id: model_id as u32,
+                            name: &def.handling_id,
+                            class: vehicle_class_from_ide(&def.vehicle_type),
+                            position: p,
+                            yaw: 0.0,
+                            color1: sample_sa_car_color(model_id as usize),
+                            handling: self.handling.as_ref(),
+                        });
+                    }
+                }
+                ScmWorldCommand::CreatePickup { model_id, pos, .. } => {
+                    let p = Vec3::from_array(pos);
+                    if self.scm_pickups.len() < 128
+                        && !self
+                            .scm_pickups
+                            .iter()
+                            .any(|(ep, _)| ep.distance_squared(p) < 1.0)
+                    {
+                        self.scm_pickups.push((p, model_id));
+                    }
+                }
+                ScmWorldCommand::AddBlip { pos, .. } => {
+                    let p = Vec3::from_array(pos);
+                    if self.scm_blips.len() < 64
+                        && !self
+                            .scm_blips
+                            .iter()
+                            .any(|(bp, _)| bp.distance_squared(p) < 4.0)
+                    {
+                        self.scm_blips.push((p, 0));
+                    }
+                }
+                ScmWorldCommand::PrintText {
+                    key, duration_ms, ..
+                } => {
+                    let txt = self.localization.get("MAIN", &key).to_string();
+                    if !txt.is_empty() && txt != key {
+                        self.set_status(txt, (duration_ms as f32 / 1000.0).clamp(2.0, 10.0));
+                    }
+                }
+                ScmWorldCommand::CreatePlayer { .. }
+                | ScmWorldCommand::CreateChar { .. }
+                | ScmWorldCommand::CreateCarGenerator { .. }
+                | ScmWorldCommand::DoFade { .. }
+                | ScmWorldCommand::LoadScene(_)
+                | ScmWorldCommand::DisplayHud(_)
+                | ScmWorldCommand::DisplayRadar(_)
+                | ScmWorldCommand::RequestModel(_) => {
+                    debug!(?cmd, "Processed SCM boot/script opcode");
+                }
+            }
+        }
     }
 
     fn read_archive_entry(&self, entry_name: &str) -> Option<Vec<u8>> {
@@ -285,9 +438,8 @@ impl GameWorldState {
         None
     }
 
-    fn ensure_txd_loaded(&mut self, renderer: &mut SceneRenderer, txd_name: &str) {
-        let txd_lower = txd_name.trim().to_ascii_lowercase();
-        if txd_lower.is_empty() || !self.loaded_txds.insert(txd_lower.clone()) {
+    fn load_single_txd(&mut self, renderer: &mut SceneRenderer, txd_lower: &str) {
+        if txd_lower.is_empty() || !self.loaded_txds.insert(txd_lower.to_string()) {
             return;
         }
         let txd_entry = format!("{txd_lower}.txd");
@@ -295,32 +447,39 @@ impl GameWorldState {
             self.vfs.as_ref().and_then(|v| {
                 v.read_bytes(&format!("models/generic/{txd_entry}"))
                     .or_else(|_| v.read_bytes(&format!("models/{txd_entry}")))
+                    .or_else(|_| v.read_bytes(&format!("models/txd/{txd_entry}")))
                     .ok()
             })
         });
         let Some(bytes) = bytes else {
             return;
         };
-        let Ok(archive) = TxdArchive::parse(&bytes) else {
-            return;
-        };
-        for tex in archive.textures {
-            let tex_idx = renderer.upload_rgba8_texture(
-                &format!("{txd_lower}/{}", tex.name),
-                tex.width,
-                tex.height,
-                &tex.rgba8,
-            );
-            let tex_lower = tex.name.to_ascii_lowercase();
+        for (name_lower, w, h, rgba, has_alpha) in decode_txd_with_masks(&bytes) {
+            let tex_idx =
+                renderer.upload_rgba8_texture(&format!("{txd_lower}/{name_lower}"), w, h, &rgba);
+            if has_alpha {
+                self.alpha_textures.insert(tex_idx);
+            }
+            self.txd_first_tex
+                .entry(txd_lower.to_string())
+                .or_insert(tex_idx);
             self.cached_textures
-                .insert(format!("{txd_lower}/{tex_lower}"), tex_idx);
-            self.cached_textures.entry(tex_lower).or_insert(tex_idx);
+                .insert(format!("{txd_lower}/{name_lower}"), tex_idx);
+            self.cached_textures.entry(name_lower).or_insert(tex_idx);
         }
+    }
+
+    fn ensure_txd_loaded(&mut self, renderer: &mut SceneRenderer, txd_name: &str) -> Vec<String> {
+        let chain = self.world.resolve_txd_chain(txd_name);
+        for txd in chain.iter().rev() {
+            self.load_single_txd(renderer, txd);
+        }
+        chain
     }
 
     fn resolve_texture_idx(
         &self,
-        txd_lower: &str,
+        txd_chain: &[String],
         tex_name: Option<&str>,
         fallback: usize,
     ) -> usize {
@@ -328,17 +487,56 @@ impl GameWorldState {
             return fallback;
         };
         let tex_lower = raw.to_ascii_lowercase();
-        if !txd_lower.is_empty()
-            && let Some(&idx) = self
+        for txd_lower in txd_chain {
+            if let Some(&idx) = self
                 .cached_textures
                 .get(&format!("{txd_lower}/{tex_lower}"))
-        {
-            return idx;
+            {
+                return idx;
+            }
+        }
+        for shared in ["generic", "particle", "vehicle", "effectspc", "misc"] {
+            if let Some(&idx) = self.cached_textures.get(&format!("{shared}/{tex_lower}")) {
+                return idx;
+            }
         }
         self.cached_textures
             .get(&tex_lower)
             .copied()
             .unwrap_or(fallback)
+    }
+
+    fn upload_submeshes(
+        &self,
+        renderer: &mut SceneRenderer,
+        label_prefix: &str,
+        subs: Vec<DffSubMesh>,
+        txd_chain: &[String],
+    ) -> (Vec<CachedSubMesh>, f32, f32) {
+        let mut min_z = f32::INFINITY;
+        let mut max_r = 2.0_f32;
+        let mut cached_subs = Vec::with_capacity(subs.len());
+        for (idx, sub) in subs.into_iter().enumerate() {
+            min_z = min_z.min(sub.cpu_mesh.min_z());
+            let tex_idx = self.resolve_texture_idx(
+                txd_chain,
+                sub.texture_name.as_deref(),
+                renderer.white_tex,
+            );
+            let handle = renderer.upload_mesh(&format!("{label_prefix}#{idx}"), &sub.cpu_mesh);
+            max_r = max_r.max(renderer.mesh_radius(handle));
+            let has_alpha_tex = self.alpha_textures.contains(&tex_idx);
+            cached_subs.push(CachedSubMesh {
+                mesh: handle,
+                texture_idx: tex_idx,
+                material_color: sub.material_color,
+                has_alpha_tex,
+            });
+        }
+        if !min_z.is_finite() {
+            min_z = 0.0;
+        }
+        (cached_subs, min_z, max_r)
     }
 
     fn load_dff_model(
@@ -353,9 +551,7 @@ impl GameWorldState {
         {
             return false;
         }
-        if !txd_lower.is_empty() {
-            self.ensure_txd_loaded(renderer, txd_lower);
-        }
+        let txd_chain = self.ensure_txd_loaded(renderer, txd_lower);
         let Some(bytes) = self.read_archive_entry(&dff_name) else {
             self.failed_dff_lookups.insert(dff_name);
             return false;
@@ -369,30 +565,72 @@ impl GameWorldState {
             self.failed_dff_lookups.insert(dff_name);
             return false;
         }
-
-        let mut min_z = f32::INFINITY;
-        let mut cached_subs = Vec::with_capacity(subs.len());
-        for (idx, sub) in subs.into_iter().enumerate() {
-            min_z = min_z.min(sub.cpu_mesh.min_z());
-            let tex_idx = self.resolve_texture_idx(
-                txd_lower,
-                sub.texture_name.as_deref(),
-                renderer.white_tex,
-            );
-            let handle = renderer.upload_mesh(&format!("{dff_name}#{idx}"), &sub.cpu_mesh);
-            cached_subs.push(CachedSubMesh {
-                mesh: handle,
-                texture_idx: tex_idx,
-                material_color: sub.material_color,
-            });
-        }
-        if !min_z.is_finite() {
-            min_z = 0.0;
-        }
+        let (cached_subs, _, bounding_radius) =
+            self.upload_submeshes(renderer, &dff_name, subs, &txd_chain);
         self.cached_dff_meshes.insert(
             dff_name,
             CachedDffModel {
                 submeshes: cached_subs,
+                bounding_radius,
+            },
+        );
+        true
+    }
+
+    fn load_vehicle_model(
+        &mut self,
+        renderer: &mut SceneRenderer,
+        model_lower: &str,
+        txd_lower: &str,
+    ) -> bool {
+        let dff_name = format!("{model_lower}.dff");
+        if self.cached_vehicle_models.contains_key(&dff_name)
+            || self.failed_dff_lookups.contains(&dff_name)
+        {
+            return false;
+        }
+        let txd_chain = self.ensure_txd_loaded(renderer, txd_lower);
+        let Some(bytes) = self.read_archive_entry(&dff_name) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let Ok(clump) = DffClump::parse(&bytes) else {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        };
+        let parts = CpuMeshData::dff_vehicle_parts(&clump);
+        if parts.body.is_empty() && parts.wheel.is_empty() {
+            self.failed_dff_lookups.insert(dff_name);
+            return false;
+        }
+        let wheel_local_min_z = parts
+            .wheel
+            .iter()
+            .map(|s| s.cpu_mesh.min_z())
+            .fold(f32::INFINITY, f32::min);
+        let (body, mut min_z, _) = self.upload_submeshes(
+            renderer,
+            &format!("{dff_name}/body"),
+            parts.body,
+            &txd_chain,
+        );
+        let (wheel, _, _) = self.upload_submeshes(
+            renderer,
+            &format!("{dff_name}/wheel"),
+            parts.wheel,
+            &txd_chain,
+        );
+        if wheel_local_min_z.is_finite() {
+            for mount in &parts.wheel_mounts {
+                min_z = min_z.min(mount.offset.z + wheel_local_min_z);
+            }
+        }
+        self.cached_vehicle_models.insert(
+            dff_name,
+            CachedVehicleModel {
+                body,
+                wheel,
+                wheel_mounts: parts.wheel_mounts,
                 min_z,
             },
         );
@@ -407,7 +645,7 @@ impl GameWorldState {
         if self.failed_dff_lookups.contains(&dff_name) {
             return false;
         }
-        self.ensure_txd_loaded(renderer, model_lower);
+        let txd_chain = self.ensure_txd_loaded(renderer, model_lower);
         let Some(bytes) = self.read_archive_entry(&dff_name) else {
             self.failed_dff_lookups.insert(dff_name);
             return false;
@@ -426,7 +664,7 @@ impl GameWorldState {
             .into_iter()
             .map(|sub| {
                 let texture_idx = self.resolve_texture_idx(
-                    model_lower,
+                    &txd_chain,
                     sub.texture_name.as_deref(),
                     renderer.white_tex,
                 );
@@ -449,19 +687,102 @@ impl GameWorldState {
         true
     }
 
+    fn load_cj_from_player_img(&mut self, renderer: &mut SceneRenderer) {
+        let Some(player_img) = &self.player_archive else {
+            return;
+        };
+        // Default CJ Grove Street outfit: head (`player_face`), white tank top (`vest`), blue jeans (`jeansdenim`), sneakers (`sneakerbincblk`), bare hands (`hands`).
+        const CJ_PARTS: [(&str, &str); 5] = [
+            ("head", "player_face"),
+            ("vest", "vest"),
+            ("jeans", "jeansdenim"),
+            ("sneaker", "sneakerbincblk"),
+            ("hands", "hands"),
+        ];
+        for (dff_stem, txd_stem) in CJ_PARTS {
+            let mut part_textures = HashMap::new();
+            let mut primary_tex = None;
+            let txd_entry = format!("{txd_stem}.txd");
+            if let Ok(txd_bytes) = player_img.read_entry(&txd_entry) {
+                for (tex_lower, w, h, rgba, has_alpha) in decode_txd_with_masks(&txd_bytes) {
+                    let tid = renderer.upload_rgba8_texture(
+                        &format!("cj/{txd_stem}/{tex_lower}"),
+                        w,
+                        h,
+                        &rgba,
+                    );
+                    if has_alpha {
+                        self.alpha_textures.insert(tid);
+                    }
+                    if primary_tex.is_none() {
+                        primary_tex = Some(tid);
+                    }
+                    part_textures.insert(tex_lower, tid);
+                }
+            }
+            let Ok(dff_bytes) = player_img.read_entry(&format!("{dff_stem}.dff")) else {
+                continue;
+            };
+            let Ok(clump) = DffClump::parse(&dff_bytes) else {
+                continue;
+            };
+            let subs = CpuMeshData::dff_clump_submeshes(&clump);
+            if subs.is_empty() {
+                continue;
+            }
+            let skin = clump.geometries.iter().find_map(|g| g.skin.clone());
+            let mut submeshes = Vec::with_capacity(subs.len());
+            let mut mesh_handles = Vec::with_capacity(subs.len());
+            for (idx, sub) in subs.into_iter().enumerate() {
+                let fallback_tex = primary_tex.unwrap_or(renderer.white_tex);
+                let texture_idx = sub
+                    .texture_name
+                    .as_deref()
+                    .and_then(|n| part_textures.get(&n.to_ascii_lowercase()).copied())
+                    .unwrap_or(fallback_tex);
+                let material_color = sub.material_color;
+                let handle = renderer
+                    .upload_dynamic_mesh(&format!("cj_part_{dff_stem}#{idx}"), &sub.cpu_mesh);
+                mesh_handles.push((handle, texture_idx, material_color));
+                submeshes.push(SkinnedSubMeshTemplate {
+                    sub,
+                    texture_idx,
+                    material_color,
+                });
+            }
+            self.cj_parts.push(CachedCjPart {
+                rig: CachedSkinnedPedRig {
+                    frames: clump.frames,
+                    skin,
+                    submeshes,
+                },
+                mesh_handles,
+            });
+        }
+        if !self.cj_parts.is_empty() {
+            info!(
+                parts = self.cj_parts.len(),
+                "Loaded modular skinned CJ parts from player.img"
+            );
+        }
+    }
+
     pub fn preload_render_meshes(&mut self, renderer: &mut SceneRenderer) {
         if let Some(water_cpu) = CpuMeshData::from_water_quads(&self.world.water_quads) {
             self.water_mesh = Some(renderer.upload_mesh("sa_water_quads", &water_cpu));
         }
         self.marker_mesh =
             Some(renderer.upload_mesh("sa_enex_marker", &CpuMeshData::marker_cone(0.62, 1.15)));
+        if self.player_archive.is_some() {
+            self.load_cj_from_player_img(renderer);
+        }
         if self.gta3_archive.is_none() && self.gta_int_archive.is_none() {
             return;
         }
 
-        // Shared vehicle/generic TXDs resolved as parent fallback textures
-        for shared_txd in ["vehicle", "misc", "particle"] {
-            self.ensure_txd_loaded(renderer, shared_txd);
+        // Shared vehicle/generic TXDs resolved as fallback & txdp roots
+        for shared_txd in ["generic", "particle", "vehicle", "effectspc", "misc"] {
+            self.load_single_txd(renderer, shared_txd);
         }
 
         // Skinned pedestrian models (`ped.ifp` bone rigs)
@@ -469,7 +790,7 @@ impl GameWorldState {
             self.load_ped_rig(renderer, ped_model);
         }
 
-        // Preload starter vehicles (`GREENWOO`, `BMX`, `INFERNUS`, `COPCARLA`)
+        // Preload starter vehicles (`GREENWOO`, `BMX`, `INFERNUS`, `COPCARLA`) with 4-wheel mounts
         let vehicle_specs: Vec<(String, String)> = self
             .vehicles
             .vehicles
@@ -490,15 +811,16 @@ impl GameWorldState {
             )))
             .collect();
         for (model, txd) in vehicle_specs {
-            self.load_dff_model(renderer, &model, &txd);
+            self.load_vehicle_model(renderer, &model, &txd);
         }
 
         self.world
             .update_streaming(self.player.position, self.config.graphics.draw_distance);
-        let initial_loaded = self.stream_nearby_render_assets(renderer, 64);
+        let initial_loaded = self.stream_nearby_render_assets(renderer, 350);
         if initial_loaded > 0 || !self.cached_dff_meshes.is_empty() {
             info!(
                 models = self.cached_dff_meshes.len(),
+                vehicles = self.cached_vehicle_models.len(),
                 textures = self.cached_textures.len(),
                 "Preloaded textured RenderWare DFF/TXD assets"
             );
@@ -514,24 +836,44 @@ impl GameWorldState {
         if self.gta3_archive.is_none() && self.gta_int_archive.is_none() {
             return 0;
         }
-        let mut pending: Vec<(f32, String, String)> = Vec::new();
+        let mut pending_vehicles: Vec<(String, String)> = Vec::new();
         for v in &self.vehicles.vehicles {
             let def = self.world.vehicles.get(&v.model_id);
             let model_lower = def
                 .map(|d| d.model_name.to_ascii_lowercase())
                 .unwrap_or_else(|| v.name.to_ascii_lowercase());
             let dff_name = format!("{model_lower}.dff");
-            if !self.cached_dff_meshes.contains_key(&dff_name)
+            if !self.cached_vehicle_models.contains_key(&dff_name)
                 && !self.failed_dff_lookups.contains(&dff_name)
             {
                 let txd_lower = def
                     .map(|d| d.txd_name.to_ascii_lowercase())
                     .unwrap_or_else(|| model_lower.clone());
-                pending.push((0.0, model_lower, txd_lower));
+                pending_vehicles.push((model_lower, txd_lower));
             }
         }
+        let mut loaded = 0usize;
+        for (model_lower, txd_lower) in pending_vehicles {
+            if loaded >= budget {
+                return loaded;
+            }
+            if self.load_vehicle_model(renderer, &model_lower, &txd_lower) {
+                loaded += 1;
+            }
+        }
+
+        let detail_cap = (self.config.graphics.draw_distance * 0.65).clamp(180.0, 320.0);
+        let max_draw_sq = self.config.graphics.draw_distance.powi(2);
+        let mut pending: Vec<(f32, String, String)> = Vec::new();
         for p in self.world.active_placements(self.player.interior) {
-            if p.is_lod {
+            if !p.is_active_at_hour(self.clock.hour) {
+                continue;
+            }
+            let dist_sq = p.position.distance_squared(self.player.position);
+            if dist_sq > max_draw_sq {
+                continue;
+            }
+            if p.is_lod && dist_sq < (detail_cap - 20.0).powi(2) {
                 continue;
             }
             let model_lower = p.model_name.to_ascii_lowercase();
@@ -541,12 +883,16 @@ impl GameWorldState {
             {
                 continue;
             }
-            let dist = p.position.distance_squared(self.player.position);
-            pending.push((dist, model_lower, p.txd_name.to_ascii_lowercase()));
+            // Stream nearby non-LOD street geometry before distant skyline LODs
+            let priority = if p.is_lod {
+                dist_sq + 200_000.0
+            } else {
+                dist_sq
+            };
+            pending.push((priority, model_lower, p.txd_name.to_ascii_lowercase()));
         }
         pending.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        let mut loaded = 0usize;
         for (_, model_lower, txd_lower) in pending {
             if loaded >= budget {
                 break;
@@ -560,35 +906,60 @@ impl GameWorldState {
 
     /// Deform CJ & active NPC pedestrian vertex buffers using sampled `ped.ifp` bone poses.
     pub fn update_skinned_meshes(&mut self, renderer: &mut SceneRenderer) {
-        if self.ped_rigs.is_empty() {
+        if self.cj_parts.is_empty() && self.ped_rigs.is_empty() {
             return;
         }
 
-        // Update CJ (skinned "fam1" rig)
-        if self.player.control_mode == ControlMode::OnFoot
-            && let Some(rig) = self.ped_rigs.get("fam1")
-        {
-            if self.cj_skinned_meshes.is_empty() {
-                for (idx, tpl) in rig.submeshes.iter().enumerate() {
-                    let handle =
-                        renderer.upload_dynamic_mesh(&format!("cj_skin#{idx}"), &tpl.sub.cpu_mesh);
-                    self.cj_skinned_meshes
-                        .push((handle, tpl.texture_idx, tpl.material_color));
+        if self.player.control_mode == ControlMode::OnFoot {
+            let poses = if !self.ped_ifp_lib.is_empty() {
+                Some(self.player.anim.sample_poses(&self.ped_ifp_lib))
+            } else {
+                None
+            };
+            if !self.cj_parts.is_empty() {
+                if let Some(poses) = &poses {
+                    for part in &mut self.cj_parts {
+                        if let Some(skin) = &part.rig.skin {
+                            let mats = compute_skin_matrices(&part.rig.frames, skin, poses);
+                            if !mats.is_empty() {
+                                for (idx, tpl) in part.rig.submeshes.iter().enumerate() {
+                                    if tpl.sub.skin_weights.is_some()
+                                        && let Some(&(handle, _, _)) = part.mesh_handles.get(idx)
+                                    {
+                                        tpl.sub.compute_skinned_vertices(
+                                            &mats,
+                                            &mut self.skin_vertex_scratch,
+                                        );
+                                        renderer.update_mesh_vertices(
+                                            handle,
+                                            &self.skin_vertex_scratch,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-            }
-            if !self.ped_ifp_lib.is_empty()
-                && let Some(skin) = &rig.skin
-            {
-                let poses = self.player.anim.sample_poses(&self.ped_ifp_lib);
-                let mats = compute_skin_matrices(&rig.frames, skin, &poses);
-                if !mats.is_empty() {
+            } else if let Some(rig) = self.ped_rigs.get("fam1") {
+                if self.cj_skinned_meshes.is_empty() {
                     for (idx, tpl) in rig.submeshes.iter().enumerate() {
-                        if tpl.sub.skin_weights.is_some()
-                            && let Some(&(handle, _, _)) = self.cj_skinned_meshes.get(idx)
-                        {
-                            tpl.sub
-                                .compute_skinned_vertices(&mats, &mut self.skin_vertex_scratch);
-                            renderer.update_mesh_vertices(handle, &self.skin_vertex_scratch);
+                        let handle = renderer
+                            .upload_dynamic_mesh(&format!("cj_skin#{idx}"), &tpl.sub.cpu_mesh);
+                        self.cj_skinned_meshes
+                            .push((handle, tpl.texture_idx, tpl.material_color));
+                    }
+                }
+                if let (Some(poses), Some(skin)) = (&poses, &rig.skin) {
+                    let mats = compute_skin_matrices(&rig.frames, skin, poses);
+                    if !mats.is_empty() {
+                        for (idx, tpl) in rig.submeshes.iter().enumerate() {
+                            if tpl.sub.skin_weights.is_some()
+                                && let Some(&(handle, _, _)) = self.cj_skinned_meshes.get(idx)
+                            {
+                                tpl.sub
+                                    .compute_skinned_vertices(&mats, &mut self.skin_vertex_scratch);
+                                renderer.update_mesh_vertices(handle, &self.skin_vertex_scratch);
+                            }
                         }
                     }
                 }
@@ -1223,6 +1594,7 @@ impl GameWorldState {
             &self.world.path_graph,
         );
         self.scm.tick(dt);
+        self.drain_scm_world_commands();
         self.missions.tick(dt, &mut self.player, &mut self.scm);
 
         if matches!(
@@ -1241,18 +1613,7 @@ impl GameWorldState {
         self.world
             .update_streaming(self.player.position, self.config.graphics.draw_distance);
         self.sync_collision_sectors();
-
-        let cam_dist = if self.player.control_mode == ControlMode::InVehicle {
-            9.5
-        } else {
-            5.8
-        };
-        self.camera.update_third_person(
-            self.player.position,
-            self.player.yaw,
-            self.player.pitch,
-            cam_dist,
-        );
+        self.update_player_camera();
     }
 
     pub fn apply_ui_actions(&mut self, actions: UiActionQueue) {
@@ -1261,6 +1622,7 @@ impl GameWorldState {
         }
         if actions.start_new_game {
             self.player = PlayerEntity::default();
+            self.player.position = Vec3::new(2488.56, -1666.86, 13.38);
             self.player
                 .weapons
                 .give_weapon(WeaponInventory::preset_colt45(), 51);
@@ -1273,6 +1635,10 @@ impl GameWorldState {
                 .update_streaming(self.player.position, self.config.graphics.draw_distance);
             self.sync_collision_sectors();
             self.snap_initial_spawns_to_ground();
+            self.update_player_camera();
+        }
+        if actions.resume_game {
+            self.update_player_camera();
         }
         if let Some(w) = actions.set_weather {
             self.world.weather = w;
@@ -1309,6 +1675,7 @@ impl GameWorldState {
             {
                 self.player.position.z = gz + 0.1;
             }
+            self.update_player_camera();
         }
         if let Some(slot) = actions.save_to_slot {
             let data = self.to_save_data(slot);
@@ -1395,65 +1762,147 @@ impl GameWorldState {
     pub fn collect_render_batches(&self, renderer: &SceneRenderer) -> Vec<RenderInstanceBatch> {
         let frustum = self.camera.frustum();
         let in_exterior = self.player.interior == 0;
-        let ground_instances = if in_exterior {
-            let ground_z = if self.world.loaded_from_original_data {
-                -0.25
-            } else {
-                0.0
-            };
-            vec![InstanceData::from_transform(
-                Vec3::new(self.player.position.x, self.player.position.y, ground_z),
+        let ground_instances = if in_exterior && !self.world.loaded_from_original_data {
+            vec![InstanceData::from_transform_lit(
+                Vec3::new(self.player.position.x, self.player.position.y, 0.0),
                 Quat::IDENTITY,
                 Vec3::ONE,
                 [0.85, 0.88, 0.80, 1.0],
+                1.0,
+                0.0,
             )]
         } else {
             Vec::new()
         };
 
         let mut box_instances = Vec::new();
-        let mut custom_batches: HashMap<(usize, usize), Vec<InstanceData>> = HashMap::new();
+        let mut custom_batches: HashMap<(usize, usize, bool, bool), Vec<InstanceData>> =
+            HashMap::new();
 
-        // Player character (CJ) when on foot (skinned ped.ifp rig when available, fallback box)
+        // Player character (CJ): modular player.img rig -> fallback fam1 rig -> fallback box
         if self.player.control_mode == ControlMode::OnFoot {
-            if !self.cj_skinned_meshes.is_empty() {
-                let rot = Quat::from_rotation_z(self.player.yaw - std::f32::consts::FRAC_PI_2);
-                let pos = self.player.position + Vec3::Z;
+            let rot = Quat::from_rotation_z(self.player.yaw - std::f32::consts::FRAC_PI_2);
+            let pos = self.player.position + Vec3::Z;
+            if !self.cj_parts.is_empty() {
+                for part in &self.cj_parts {
+                    for &(mesh, tex_idx, mat_col) in &part.mesh_handles {
+                        let transparent =
+                            self.alpha_textures.contains(&tex_idx) || mat_col[3] < 0.98;
+                        custom_batches
+                            .entry((mesh.0, tex_idx, transparent, false))
+                            .or_default()
+                            .push(InstanceData::from_transform_lit(
+                                pos,
+                                rot,
+                                Vec3::ONE,
+                                mat_col,
+                                1.0,
+                                0.05,
+                            ));
+                    }
+                }
+            } else if !self.cj_skinned_meshes.is_empty() {
                 for &(mesh, tex_idx, mat_col) in &self.cj_skinned_meshes {
+                    let transparent = self.alpha_textures.contains(&tex_idx) || mat_col[3] < 0.98;
                     custom_batches
-                        .entry((mesh.0, tex_idx))
+                        .entry((mesh.0, tex_idx, transparent, false))
                         .or_default()
-                        .push(InstanceData::from_transform(pos, rot, Vec3::ONE, mat_col));
+                        .push(InstanceData::from_transform_lit(
+                            pos,
+                            rot,
+                            Vec3::ONE,
+                            mat_col,
+                            1.0,
+                            0.05,
+                        ));
                 }
             } else {
-                box_instances.push(InstanceData::from_transform(
+                box_instances.push(InstanceData::from_transform_lit(
                     self.player.position + Vec3::new(0.0, 0.0, 0.9),
                     Quat::from_rotation_z(self.player.yaw),
                     Vec3::new(0.65, 0.45, 1.8),
-                    [0.95, 0.95, 0.95, 1.0], // White tank top
+                    [0.95, 0.95, 0.95, 1.0],
+                    1.0,
+                    0.0,
                 ));
             }
         }
 
         if in_exterior {
-            // Vehicles (use real RenderWare DFF+TXD submeshes when available, fallback to colored bounds)
+            // Vehicles (RenderWare body + 4 articulated wheel mounts, fallback bounds)
             for v in &self.vehicles.vehicles {
                 if !frustum.intersects_sphere(v.position, 6.0) {
                     continue;
                 }
-                let dff_key = format!("{}.dff", v.name.to_ascii_lowercase());
-                if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
-                    let z_lift = (-model.min_z).clamp(0.0, 1.5);
-                    let pos = v.position + Vec3::new(0.0, 0.0, z_lift);
+                let model_lower = self
+                    .world
+                    .vehicles
+                    .get(&v.model_id)
+                    .map(|d| d.model_name.to_ascii_lowercase())
+                    .unwrap_or_else(|| v.name.to_ascii_lowercase());
+                let dff_key = format!("{model_lower}.dff");
+                if let Some(v_model) = self.cached_vehicle_models.get(&dff_key) {
+                    let z_lift = if v_model.min_z.is_finite() {
+                        (-v_model.min_z).clamp(0.0, 1.5)
+                    } else {
+                        0.0
+                    };
+                    let body_pos = v.position + Vec3::new(0.0, 0.0, z_lift);
                     // Match RenderWare GTA:SA forward-axis (+Y) orientation cleanly to yaw rotation
-                    let rot =
+                    let body_rot =
                         v.rotation_quat() * Quat::from_rotation_z(-std::f32::consts::FRAC_PI_2);
-                    for sub in &model.submeshes {
+                    for sub in &v_model.body {
                         let tint = apply_vehicle_paint_tint(sub.material_color, v.color1, v.color2);
+                        let transparent = tint[3] < 0.98;
+                        let alpha_cutoff = if sub.has_alpha_tex && !transparent {
+                            0.35
+                        } else if transparent {
+                            0.02
+                        } else {
+                            0.0
+                        };
                         custom_batches
-                            .entry((sub.mesh.0, sub.texture_idx))
+                            .entry((sub.mesh.0, sub.texture_idx, transparent, false))
                             .or_default()
-                            .push(InstanceData::from_transform(pos, rot, Vec3::ONE, tint));
+                            .push(InstanceData::from_transform_lit(
+                                body_pos,
+                                body_rot,
+                                Vec3::ONE,
+                                tint,
+                                1.0,
+                                alpha_cutoff,
+                            ));
+                    }
+                    if !v_model.wheel.is_empty() {
+                        for mount in &v_model.wheel_mounts {
+                            let flip = if mount.is_left {
+                                Quat::from_rotation_z(std::f32::consts::PI)
+                            } else {
+                                Quat::IDENTITY
+                            };
+                            let spin = Quat::from_rotation_x(-v.wheel_spin);
+                            let steer = if mount.is_front {
+                                Quat::from_rotation_z(v.steer_angle)
+                            } else {
+                                Quat::IDENTITY
+                            };
+                            let wheel_rot = body_rot * (steer * spin * flip);
+                            let wheel_pos = body_pos + body_rot * mount.offset;
+                            for sub in &v_model.wheel {
+                                let transparent = sub.material_color[3] < 0.98;
+                                custom_batches
+                                    .entry((sub.mesh.0, sub.texture_idx, transparent, false))
+                                    .or_default()
+                                    .push(InstanceData::from_transform_lit(
+                                        wheel_pos,
+                                        wheel_rot,
+                                        Vec3::ONE,
+                                        sub.material_color,
+                                        1.0,
+                                        if sub.has_alpha_tex { 0.35 } else { 0.0 },
+                                    ));
+                            }
+                        }
                     }
                 } else {
                     let scale = match v.params.class {
@@ -1463,11 +1912,13 @@ impl GameWorldState {
                         VehicleClass::Truck | VehicleClass::Bus => Vec3::new(6.8, 2.5, 2.8),
                         _ => Vec3::new(4.3, 1.9, 1.45),
                     };
-                    box_instances.push(InstanceData::from_transform(
+                    box_instances.push(InstanceData::from_transform_lit(
                         v.position + Vec3::new(0.0, 0.0, scale.z * 0.5),
                         v.rotation_quat(),
                         scale,
                         [v.color1[0], v.color1[1], v.color1[2], 1.0],
+                        1.0,
+                        0.0,
                     ));
                 }
             }
@@ -1482,14 +1933,18 @@ impl GameWorldState {
                         let pos = ped.position + Vec3::Z;
                         for (idx, handle) in handles.iter().enumerate() {
                             if let Some(tpl) = rig.submeshes.get(idx) {
+                                let transparent = self.alpha_textures.contains(&tpl.texture_idx)
+                                    || tpl.material_color[3] < 0.98;
                                 custom_batches
-                                    .entry((handle.0, tpl.texture_idx))
+                                    .entry((handle.0, tpl.texture_idx, transparent, false))
                                     .or_default()
-                                    .push(InstanceData::from_transform(
+                                    .push(InstanceData::from_transform_lit(
                                         pos,
                                         rot,
                                         Vec3::ONE,
                                         tpl.material_color,
+                                        1.0,
+                                        0.05,
                                     ));
                             }
                         }
@@ -1499,11 +1954,13 @@ impl GameWorldState {
                         } else {
                             [0.20, 0.65, 0.25, 1.0]
                         };
-                        box_instances.push(InstanceData::from_transform(
+                        box_instances.push(InstanceData::from_transform_lit(
                             ped.position + Vec3::new(0.0, 0.0, 0.85),
                             Quat::from_rotation_z(ped.yaw),
                             Vec3::new(0.6, 0.4, 1.7),
                             col,
+                            1.0,
+                            0.0,
                         ));
                     }
                 }
@@ -1513,26 +1970,30 @@ impl GameWorldState {
         // Mission trigger markers
         for trig in self.missions.available_triggers() {
             if frustum.intersects_sphere(trig.position, 4.0) {
-                box_instances.push(InstanceData::from_transform(
+                box_instances.push(InstanceData::from_transform_lit(
                     trig.position + Vec3::new(0.0, 0.0, 1.2),
                     Quat::IDENTITY,
                     Vec3::new(1.2, 1.2, 2.4),
                     [0.95, 0.25, 0.20, 0.75],
+                    2.0,
+                    0.0,
                 ));
             }
         }
 
         // Active mission target beacon
         if let Some(cp) = self.missions.current_target_position() {
-            box_instances.push(InstanceData::from_transform(
+            box_instances.push(InstanceData::from_transform_lit(
                 cp + Vec3::new(0.0, 0.0, 2.0),
                 Quat::IDENTITY,
                 Vec3::new(1.4, 1.4, 4.0),
                 [0.98, 0.82, 0.15, 0.75],
+                2.0,
+                0.0,
             ));
         }
 
-        // Floating ENEX doorway & interior counter markers
+        // Floating ENEX doorway, interior counter, and SCM pickup markers
         if let Some(marker) = self.marker_mesh {
             let t = self.timestep.total_sim_time as f32;
             let bob = (t * 3.0).sin() * 0.14;
@@ -1547,12 +2008,30 @@ impl GameWorldState {
                 if pos.distance_squared(self.player.position) <= 120.0 * 120.0
                     && frustum.intersects_sphere(pos + Vec3::Z, 2.0)
                 {
-                    marker_instances.push(InstanceData::from_transform(
+                    marker_instances.push(InstanceData::from_transform_lit(
                         pos + Vec3::new(0.0, 0.0, 1.1 + bob),
                         spin,
                         Vec3::ONE,
                         [1.0, 0.85, 0.12, 0.92],
+                        2.0,
+                        0.0,
                     ));
+                }
+            }
+            if cur_int == 0 {
+                for &(pickup_pos, _) in &self.scm_pickups {
+                    if pickup_pos.distance_squared(self.player.position) <= 120.0 * 120.0
+                        && frustum.intersects_sphere(pickup_pos + Vec3::Z, 2.0)
+                    {
+                        marker_instances.push(InstanceData::from_transform_lit(
+                            pickup_pos + Vec3::new(0.0, 0.0, 1.0 + bob),
+                            spin,
+                            Vec3::splat(0.75),
+                            [0.20, 0.95, 0.65, 0.90],
+                            2.0,
+                            0.0,
+                        ));
+                    }
                 }
             }
             if cur_int != 0
@@ -1567,48 +2046,101 @@ impl GameWorldState {
                 } else {
                     [0.18, 0.92, 0.36, 0.95]
                 };
-                marker_instances.push(InstanceData::from_transform(
+                marker_instances.push(InstanceData::from_transform_lit(
                     svc_pos + Vec3::new(0.0, 0.0, 1.05 + bob),
                     spin,
                     Vec3::ONE,
                     svc_color,
+                    2.0,
+                    0.0,
                 ));
             }
             if !marker_instances.is_empty() {
                 custom_batches
-                    .entry((marker.0, renderer.white_tex))
+                    .entry((marker.0, renderer.white_tex, true, false))
                     .or_default()
                     .extend(marker_instances);
             }
         }
 
-        // World streamed objects (actual textured RenderWare DFF submeshes when loaded, or fallback blocks)
+        // World streamed objects (time-of-day active check, detail vs LOD skyline, real IDE flags & alpha masks)
+        let detail_cap = (self.config.graphics.draw_distance * 0.65).clamp(180.0, 320.0);
+        let max_draw_sq = self.config.graphics.draw_distance.powi(2);
         for p in self.world.active_placements(self.player.interior) {
-            if p.is_lod {
+            if !p.is_active_at_hour(self.clock.hour) {
                 continue;
             }
-            if !frustum.intersects_sphere(p.position, 55.0) {
+            let dist_sq = p.position.distance_squared(self.player.position);
+            if dist_sq > max_draw_sq {
                 continue;
+            }
+            if p.is_lod {
+                if !self.world.loaded_from_original_data || dist_sq < (detail_cap - 15.0).powi(2) {
+                    continue;
+                }
+            } else {
+                let obj_detail = if p.draw_distance > 1.0 {
+                    p.draw_distance.max(120.0).min(detail_cap)
+                } else {
+                    detail_cap
+                };
+                if dist_sq > obj_detail.powi(2) {
+                    continue;
+                }
             }
             let dff_key = format!("{}.dff", p.model_name.to_ascii_lowercase());
             if let Some(model) = self.cached_dff_meshes.get(&dff_key) {
+                let radius = model
+                    .submeshes
+                    .iter()
+                    .map(|s| renderer.mesh_radius(s.mesh))
+                    .fold(model.bounding_radius, f32::max);
+                if !frustum.intersects_sphere(p.position, radius) {
+                    continue;
+                }
+                let is_veg = (p.flags & (IDE_FLAG_IS_TREE | IDE_FLAG_IS_PALM)) != 0;
+                let double_sided = is_veg || (p.flags & IDE_FLAG_DISABLE_BACKFACE_CULLING) != 0;
+                let flag_transparent = (p.flags
+                    & (IDE_FLAG_IS_GLASS_TYPE_1
+                        | IDE_FLAG_IS_GLASS_TYPE_2
+                        | IDE_FLAG_ADDITIVE
+                        | IDE_FLAG_DRAW_LAST
+                        | IDE_FLAG_NO_ZWRITE))
+                    != 0;
                 for sub in &model.submeshes {
+                    let cut_only = (is_veg || sub.has_alpha_tex) && !flag_transparent;
+                    let transparent =
+                        (!cut_only && flag_transparent) || sub.material_color[3] < 0.98;
+                    let alpha_cutoff = if sub.has_alpha_tex || double_sided {
+                        0.35
+                    } else if transparent {
+                        0.02
+                    } else {
+                        0.0
+                    };
                     custom_batches
-                        .entry((sub.mesh.0, sub.texture_idx))
+                        .entry((sub.mesh.0, sub.texture_idx, transparent, double_sided))
                         .or_default()
-                        .push(InstanceData::from_transform(
+                        .push(InstanceData::from_transform_lit(
                             p.position,
                             p.rotation,
                             Vec3::ONE,
                             sub.material_color,
+                            0.0,
+                            alpha_cutoff,
                         ));
                 }
-            } else if !self.world.loaded_from_original_data {
-                box_instances.push(InstanceData::from_transform(
+            } else if !p.is_lod
+                && !self.world.loaded_from_original_data
+                && frustum.intersects_sphere(p.position, 25.0)
+            {
+                box_instances.push(InstanceData::from_transform_lit(
                     p.position + Vec3::new(0.0, 0.0, 6.0),
                     p.rotation,
                     Vec3::new(14.0, 12.0, 12.0),
                     [0.72, 0.68, 0.60, 1.0],
+                    0.0,
+                    0.0,
                 ));
             }
         }
@@ -1619,32 +2151,44 @@ impl GameWorldState {
                 mesh: renderer.ground_mesh,
                 texture_idx: renderer.checker_tex,
                 instances: ground_instances,
+                transparent: false,
+                double_sided: false,
             });
         }
-        batches.push(RenderInstanceBatch {
-            mesh: renderer.box_mesh,
-            texture_idx: renderer.white_tex,
-            instances: box_instances,
-        });
+        if !box_instances.is_empty() {
+            batches.push(RenderInstanceBatch {
+                mesh: renderer.box_mesh,
+                texture_idx: renderer.white_tex,
+                instances: box_instances,
+                transparent: false,
+                double_sided: false,
+            });
+        }
 
         if in_exterior && let Some(water) = self.water_mesh {
             batches.push(RenderInstanceBatch {
                 mesh: water,
                 texture_idx: renderer.white_tex,
-                instances: vec![InstanceData::from_transform(
+                instances: vec![InstanceData::from_transform_lit(
                     Vec3::ZERO,
                     Quat::IDENTITY,
                     Vec3::ONE,
                     [1.0, 1.0, 1.0, 1.0],
+                    2.0,
+                    0.0,
                 )],
+                transparent: true,
+                double_sided: true,
             });
         }
 
-        for ((mesh_idx, tex_idx), instances) in custom_batches {
+        for ((mesh_idx, tex_idx, transparent, double_sided), instances) in custom_batches {
             batches.push(RenderInstanceBatch {
                 mesh: GpuMeshHandle(mesh_idx),
                 texture_idx: tex_idx,
                 instances,
+                transparent,
+                double_sided,
             });
         }
 
@@ -1779,6 +2323,96 @@ fn sample_sa_car_color(idx: usize) -> [f32; 3] {
         [0.36, 0.16, 0.42], // Ballas Purple
     ];
     PALETTE[idx % PALETTE.len()]
+}
+
+fn weather_from_sa_id(id: i32) -> WeatherType {
+    match id {
+        0 | 5 | 6 => WeatherType::ExtraSunnyLA,
+        1..=3 => WeatherType::SunnyLA,
+        10..=15 => WeatherType::ExtraSunnySmog,
+        4 | 7 => WeatherType::Cloudy,
+        8 | 16 => WeatherType::Rainy,
+        9 => WeatherType::Foggy,
+        19 => WeatherType::SandstormDesert,
+        _ => WeatherType::SunnyLA,
+    }
+}
+
+fn decode_txd_with_masks(bytes: &[u8]) -> Vec<(String, u32, u32, Vec<u8>, bool)> {
+    let Ok(archive) = TxdArchive::parse(bytes) else {
+        return Vec::new();
+    };
+    let by_name: HashMap<String, usize> = archive
+        .textures
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.to_ascii_lowercase(), i))
+        .collect();
+    archive
+        .textures
+        .iter()
+        .map(|tex| {
+            let lower = tex.name.to_ascii_lowercase();
+            let alpha_lower = tex.alpha_name.trim().to_ascii_lowercase();
+            let rgba = if !alpha_lower.is_empty()
+                && let Some(&mask_idx) = by_name.get(&alpha_lower)
+            {
+                let mask = &archive.textures[mask_idx];
+                merge_rgba_alpha_mask(
+                    &tex.rgba8,
+                    tex.width,
+                    tex.height,
+                    &mask.rgba8,
+                    mask.width,
+                    mask.height,
+                )
+            } else {
+                tex.rgba8.clone()
+            };
+            let has_alpha = rgba.as_chunks::<4>().0.iter().any(|px| px[3] < 250);
+            (lower, tex.width, tex.height, rgba, has_alpha)
+        })
+        .collect()
+}
+
+fn load_ui_media(vfs: &GameDataRoot, gta3: Option<&ImgArchive>, ui_state: &mut GameUiState) {
+    if let Ok(bytes) = vfs.read_bytes("models/txd/LOADSCS.TXD") {
+        let entries = decode_txd_with_masks(&bytes);
+        let chosen = entries
+            .iter()
+            .find(|(n, ..)| n == "loadsc0")
+            .or_else(|| entries.iter().find(|(n, ..)| n == "title_pc_us"))
+            .or_else(|| entries.iter().find(|(n, ..)| n == "title_pc_eu"))
+            .or_else(|| entries.first());
+        if let Some((_, w, h, rgba, _)) = chosen {
+            ui_state.media.raw_backdrop = Some((*w, *h, rgba.clone()));
+        }
+    }
+
+    if let Ok(bytes) = vfs.read_bytes("models/hud.txd") {
+        for (name, w, h, rgba, _) in decode_txd_with_masks(&bytes) {
+            ui_state.media.raw_hud_sprites.insert(name, (w, h, rgba));
+        }
+    }
+
+    if let Some(img) = gta3 {
+        let mut tiles_loaded = 0usize;
+        for tile in 0..144usize {
+            let entry = format!("radar{tile:02}.txd");
+            if let Ok(bytes) = img.read_entry(&entry)
+                && let Some((_, w, h, rgba, _)) = decode_txd_with_masks(&bytes).into_iter().next()
+            {
+                ui_state.media.raw_radar_tiles[tile] = Some((w, h, rgba));
+                tiles_loaded += 1;
+            }
+        }
+        info!(
+            backdrop = ui_state.media.raw_backdrop.is_some(),
+            hud_sprites = ui_state.media.raw_hud_sprites.len(),
+            radar_tiles = tiles_loaded,
+            "Loaded retail GTA:SA HUD, menu splash, and radar tiles"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1917,5 +2551,39 @@ mod tests {
             sim.player.weapons.slots[2].as_ref().unwrap().reserve_ammo,
             before_ammo + 50
         );
+    }
+
+    #[test]
+    fn scm_world_commands_and_decoupled_vehicle_camera_work() {
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        sim.scm.world_commands.push(ScmWorldCommand::SetTimeOfDay {
+            hour: 22,
+            minute: 15,
+        });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::ForceWeather(8));
+        sim.scm.world_commands.push(ScmWorldCommand::CreatePickup {
+            model_id: 1240,
+            pickup_type: 2,
+            pos: [2490.0, -1670.0, 13.5],
+            handle: 1,
+        });
+        sim.drain_scm_world_commands();
+        assert_eq!(sim.clock.hour, 22);
+        assert_eq!(sim.clock.minute, 15);
+        assert_eq!(sim.world.weather, WeatherType::Rainy);
+        assert_eq!(sim.scm_pickups.len(), 1);
+
+        let vid = sim.vehicles.vehicles[0].id;
+        sim.player.control_mode = ControlMode::InVehicle;
+        sim.player.current_vehicle = Some(vid);
+        let init_cam_yaw = sim.player.camera_yaw;
+        let act = ActionFrameState {
+            look_delta: glam::Vec2::new(80.0, -20.0),
+            ..Default::default()
+        };
+        sim.step_fixed_tick(1.0 / 60.0, &act);
+        assert!((sim.player.camera_yaw - init_cam_yaw).abs() > 0.1);
     }
 }

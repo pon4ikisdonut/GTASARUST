@@ -18,6 +18,8 @@ pub const RW_GEOMETRY_LIST: u32 = 0x001A;
 pub const RW_SKIN_PLG: u32 = 0x0116;
 pub const RW_HANIM_PLG: u32 = 0x011E;
 pub const RW_BIN_MESH_PLG: u32 = 0x050E;
+/// Rockstar SA CustomBuildingDNPipeline extra pre-lit night vertex color plugin chunk.
+pub const RW_EXTRA_VERT_COLOUR_PLG: u32 = 0x0253_F2F9;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RwChunkHeader {
@@ -99,6 +101,8 @@ pub struct DffGeometry {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub colors: Vec<[u8; 4]>,
+    #[serde(default)]
+    pub night_colors: Vec<[u8; 4]>,
     pub triangles: Vec<[u16; 4]>, // [v1, v2, v3, material_id]
     pub materials: Vec<DffMaterial>,
     pub splits: Vec<DffMeshSplit>,
@@ -267,6 +271,7 @@ fn parse_geometry(data: &[u8], rw_version: u32) -> Result<DffGeometry, FormatErr
         normals: Vec::new(),
         uvs: Vec::new(),
         colors: Vec::new(),
+        night_colors: Vec::new(),
         triangles: Vec::new(),
         materials: Vec::new(),
         splits: Vec::new(),
@@ -458,6 +463,22 @@ fn parse_geometry(data: &[u8], rw_version: u32) -> Result<DffGeometry, FormatErr
                                 bone_weights,
                                 inv_bind_matrices,
                             });
+                        }
+                    } else if eh.chunk_type == RW_EXTRA_VERT_COLOUR_PLG && er.remaining() >= 4 {
+                        let magic = er.read_u32_le()?;
+                        if magic != 0 {
+                            let v_count = if !geom.positions.is_empty() {
+                                geom.positions.len()
+                            } else {
+                                struct_num_verts
+                            };
+                            geom.night_colors.reserve(v_count.min(100_000));
+                            for _ in 0..v_count {
+                                if er.remaining() < 4 {
+                                    break;
+                                }
+                                geom.night_colors.push(er.read_array::<4>()?);
+                            }
                         }
                     }
                     er.seek(e_end)?;
@@ -717,8 +738,9 @@ fn decode_txd_raster(
         }
     };
 
+    let allow_dxt1_alpha = (raster_format & 0x0F00) != 0x0200;
     if let Some(dxt) = dxt_kind {
-        return decode_dxt(dxt, width, height, raw);
+        return decode_dxt(dxt, width, height, raw, allow_dxt1_alpha);
     }
 
     if let Some(pal) = palette {
@@ -791,12 +813,48 @@ fn decode_txd_raster(
             out[i * 4 + 2] = raw[i * 3];
             out[i * 4 + 3] = 255;
         }
+    } else if depth == 8 && raw.len() >= pixel_count {
+        for (i, &lum) in raw.iter().take(pixel_count).enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&[lum, lum, lum, 255]);
+        }
     }
 
     out
 }
 
-fn decode_dxt(kind: u8, width: u32, height: u32, raw: &[u8]) -> Vec<u8> {
+/// Composite an external grayscale/alpha TXD mask texture onto a decoded diffuse RGBA8 image.
+pub fn merge_rgba_alpha_mask(
+    diffuse_rgba: &[u8],
+    dw: u32,
+    dh: u32,
+    mask_rgba: &[u8],
+    mw: u32,
+    mh: u32,
+) -> Vec<u8> {
+    let mut out = diffuse_rgba.to_vec();
+    if dw == 0 || dh == 0 || mw == 0 || mh == 0 || mask_rgba.len() < (mw * mh * 4) as usize {
+        return out;
+    }
+    let dw_u = dw as usize;
+    let dh_u = dh as usize;
+    let mw_u = mw as usize;
+    let mh_u = mh as usize;
+    if out.len() < dw_u * dh_u * 4 {
+        return out;
+    }
+    for y in 0..dh_u {
+        let sy = (y * mh_u) / dh_u;
+        for x in 0..dw_u {
+            let sx = (x * mw_u) / dw_u;
+            let m_idx = (sy * mw_u + sx) * 4;
+            let lum = mask_rgba[m_idx]; // grayscale masks use R=G=B
+            out[(y * dw_u + x) * 4 + 3] = lum;
+        }
+    }
+    out
+}
+
+fn decode_dxt(kind: u8, width: u32, height: u32, raw: &[u8], allow_dxt1_alpha: bool) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let mut out = vec![255u8; w * h * 4];
@@ -820,7 +878,7 @@ fn decode_dxt(kind: u8, width: u32, height: u32, raw: &[u8]) -> Vec<u8> {
                 block[color_off + 6],
                 block[color_off + 7],
             ]);
-            let colors = dxt_color_table(c0, c1, kind == 1);
+            let colors = dxt_color_table(c0, c1, kind == 1 && allow_dxt1_alpha);
 
             for py in 0..4 {
                 for px in 0..4 {

@@ -16,12 +16,38 @@ pub enum PlayerLifeState {
     Busted,
 }
 
+fn default_camera_pitch() -> f32 {
+    -0.18
+}
+
+fn default_camera_distance() -> f32 {
+    3.6
+}
+
+fn turn_angle_toward(current: f32, target: f32, max_step: f32) -> f32 {
+    let diff = (target - current + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    if diff.abs() <= max_step {
+        target
+    } else {
+        current + diff.signum() * max_step
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerEntity {
     pub position: Vec3,
     pub velocity: Vec3,
+    /// Character world facing yaw (in radians).
     pub yaw: f32,
     pub pitch: f32,
+    /// Independent third-person orbit camera yaw & pitch (GTA:SA style: camera orbits freely while CJ faces movement or aim target).
+    #[serde(default)]
+    pub camera_yaw: f32,
+    #[serde(default = "default_camera_pitch")]
+    pub camera_pitch: f32,
+    #[serde(default = "default_camera_distance")]
+    pub camera_distance: f32,
     pub health: f32,
     pub max_health: f32,
     pub armor: f32,
@@ -50,6 +76,9 @@ impl Default for PlayerEntity {
             velocity: Vec3::ZERO,
             yaw: 0.0,
             pitch: -0.15,
+            camera_yaw: 0.0,
+            camera_pitch: default_camera_pitch(),
+            camera_distance: default_camera_distance(),
             health: 100.0,
             max_health: 100.0,
             armor: 0.0,
@@ -72,6 +101,12 @@ impl Default for PlayerEntity {
 }
 
 impl PlayerEntity {
+    /// Update orbit camera angles from mouse/right-stick input (active on foot and in vehicles).
+    pub fn update_camera_look(&mut self, look_delta_x: f32, look_delta_y: f32) {
+        self.camera_yaw -= look_delta_x * 0.0045;
+        self.camera_pitch = (self.camera_pitch - look_delta_y * 0.0045).clamp(-1.25, 1.15);
+    }
+
     /// Update camera yaw/pitch, on-foot locomotion, jumping, swimming, crouching, and weapon timers.
     pub fn update_on_foot(&mut self, dt: f32, actions: &ActionFrameState, physics: &PhysicsWorld) {
         self.weapons.tick(dt);
@@ -81,9 +116,9 @@ impl PlayerEntity {
             return;
         }
 
-        // Camera orbit look
-        self.yaw -= actions.look_delta.x * 0.005;
-        self.pitch = (self.pitch - actions.look_delta.y * 0.005).clamp(-1.25, 1.15);
+        // Camera orbit look (GTA:SA decouples camera orbit from CJ's facing yaw)
+        self.update_camera_look(actions.look_delta.x, actions.look_delta.y);
+        self.pitch = self.camera_pitch;
 
         if actions.next_weapon {
             self.weapons.cycle_next();
@@ -103,10 +138,18 @@ impl PlayerEntity {
         }
 
         // Camera-relative horizontal basis in Z-up world coordinates
-        let forward = Vec3::new(self.yaw.cos(), self.yaw.sin(), 0.0).normalize();
+        let forward = Vec3::new(self.camera_yaw.cos(), self.camera_yaw.sin(), 0.0).normalize();
         let right = Vec3::new(forward.y, -forward.x, 0.0);
         let wish_dir =
             (forward * actions.move_axis.y + right * actions.move_axis.x).normalize_or_zero();
+
+        // GTA:SA turning behavior: face camera when aiming, otherwise turn smoothly into movement direction
+        if actions.aim_or_reverse {
+            self.yaw = turn_angle_toward(self.yaw, self.camera_yaw, 16.0 * dt);
+        } else if wish_dir.length_squared() > 0.01 {
+            let target_yaw = wish_dir.y.atan2(wish_dir.x);
+            self.yaw = turn_angle_toward(self.yaw, target_yaw, 12.5 * dt);
+        }
 
         let sprinting = actions.sprint && wish_dir.length_squared() > 0.1 && self.stamina > 2.0;
         let speed = if self.in_water {

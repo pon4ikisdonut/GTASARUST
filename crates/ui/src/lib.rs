@@ -1,7 +1,7 @@
 //! Authentic GTA: San Andreas HUD, radar, menus, map screen, save/load slots,
 //! and `egui` developer diagnostics overlay.
 
-use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, Vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Stroke, TextureId, Vec2};
 use gtasarust_engine::{EngineConfig, GameClock};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
 use gtasarust_localization::LocalizationTable;
@@ -9,6 +9,7 @@ use gtasarust_missions::MissionManager;
 use gtasarust_save_system::MAX_SAVE_SLOTS;
 use gtasarust_vehicles::VehicleManager;
 use gtasarust_world::{WeatherType, WorldManager};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenState {
@@ -35,10 +36,81 @@ pub struct UiActionQueue {
     pub teleport_to: Option<glam::Vec3>,
 }
 
+/// CPU + lazy GPU-uploaded San Andreas HUD, splash backdrop, and `radarXX.txd` map tiles.
+pub struct UiMediaCache {
+    pub raw_backdrop: Option<(u32, u32, Vec<u8>)>,
+    pub raw_hud_sprites: HashMap<String, (u32, u32, Vec<u8>)>,
+    pub raw_radar_tiles: Vec<Option<(u32, u32, Vec<u8>)>>,
+    backdrop_tex: Option<egui::TextureHandle>,
+    hud_tex: HashMap<String, egui::TextureHandle>,
+    radar_tex: [Option<egui::TextureHandle>; 144],
+}
+
+impl Default for UiMediaCache {
+    fn default() -> Self {
+        Self {
+            raw_backdrop: None,
+            raw_hud_sprites: HashMap::new(),
+            raw_radar_tiles: vec![None; 144],
+            backdrop_tex: None,
+            hud_tex: HashMap::new(),
+            radar_tex: [const { None }; 144],
+        }
+    }
+}
+
+impl UiMediaCache {
+    fn backdrop_id(&mut self, ctx: &egui::Context) -> Option<TextureId> {
+        if self.backdrop_tex.is_none()
+            && let Some((w, h, rgba)) = &self.raw_backdrop
+            && *w > 0
+            && *h > 0
+        {
+            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], rgba);
+            self.backdrop_tex =
+                Some(ctx.load_texture("sa_backdrop", img, egui::TextureOptions::LINEAR));
+        }
+        self.backdrop_tex.as_ref().map(|t| t.id())
+    }
+
+    fn hud_sprite_id(&mut self, ctx: &egui::Context, name: &str) -> Option<TextureId> {
+        let key = name.to_ascii_lowercase();
+        if !self.hud_tex.contains_key(&key)
+            && let Some((w, h, rgba)) = self.raw_hud_sprites.get(&key)
+            && *w > 0
+            && *h > 0
+        {
+            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], rgba);
+            let hnd = ctx.load_texture(format!("hud_{key}"), img, egui::TextureOptions::LINEAR);
+            self.hud_tex.insert(key.clone(), hnd);
+        }
+        self.hud_tex.get(&key).map(|t| t.id())
+    }
+
+    fn radar_tile_id(&mut self, ctx: &egui::Context, tile_idx: usize) -> Option<TextureId> {
+        if tile_idx >= 144 {
+            return None;
+        }
+        if self.radar_tex[tile_idx].is_none()
+            && let Some(Some((w, h, rgba))) = self.raw_radar_tiles.get(tile_idx)
+            && *w > 0
+            && *h > 0
+        {
+            let img = egui::ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], rgba);
+            let mut opts = egui::TextureOptions::LINEAR;
+            opts.wrap_mode = egui::TextureWrapMode::ClampToEdge;
+            self.radar_tex[tile_idx] =
+                Some(ctx.load_texture(format!("radar_{tile_idx:02}"), img, opts));
+        }
+        self.radar_tex[tile_idx].as_ref().map(|t| t.id())
+    }
+}
+
 pub struct GameUiState {
     pub screen: ScreenState,
     pub show_dev_overlay: bool,
     pub status_message: Option<String>,
+    pub media: UiMediaCache,
 }
 
 impl Default for GameUiState {
@@ -47,6 +119,7 @@ impl Default for GameUiState {
             screen: ScreenState::Playing,
             show_dev_overlay: false,
             status_message: None,
+            media: UiMediaCache::default(),
         }
     }
 }
@@ -71,7 +144,11 @@ pub fn build_game_ui(
 
     match ui_state.screen {
         ScreenState::MainMenu => {
-            draw_menu_backdrop(ctx, "GRAND THEFT AUTO: SAN ANDREAS — GTASARUST");
+            draw_menu_backdrop(
+                ctx,
+                &mut ui_state.media,
+                "GRAND THEFT AUTO: SAN ANDREAS — GTASARUST",
+            );
             egui::Window::new("main_menu")
                 .title_bar(false)
                 .resizable(false)
@@ -81,6 +158,10 @@ pub fn build_game_ui(
                     ui.vertical_centered(|ui| {
                         if menu_btn(ui, loc.get("MAIN", "MENU_NEW")) {
                             actions.start_new_game = true;
+                            ui_state.screen = ScreenState::Playing;
+                        }
+                        if menu_btn(ui, "RESUME FREE ROAM") {
+                            actions.resume_game = true;
                             ui_state.screen = ScreenState::Playing;
                         }
                         if menu_btn(ui, loc.get("MAIN", "MENU_LOAD")) {
@@ -96,7 +177,7 @@ pub fn build_game_ui(
                 });
         }
         ScreenState::Paused => {
-            draw_menu_backdrop(ctx, "PAUSED");
+            draw_menu_backdrop(ctx, &mut ui_state.media, "PAUSED");
             egui::Window::new("pause_menu")
                 .title_bar(false)
                 .resizable(false)
@@ -142,6 +223,7 @@ pub fn build_game_ui(
             if config.game.show_hud {
                 draw_sa_hud(
                     ctx,
+                    &mut ui_state.media,
                     clock,
                     player,
                     vehicles,
@@ -182,14 +264,24 @@ fn menu_btn(ui: &mut egui::Ui, label: &str) -> bool {
     .clicked()
 }
 
-fn draw_menu_backdrop(ctx: &egui::Context, title: &str) {
+fn draw_menu_backdrop(ctx: &egui::Context, media: &mut UiMediaCache, title: &str) {
     let screen = ctx.content_rect();
     let painter = ctx.layer_painter(egui::LayerId::background());
-    painter.rect_filled(
-        screen,
-        0.0,
-        Color32::from_rgba_unmultiplied(10, 12, 16, 200),
-    );
+    if let Some(tex_id) = media.backdrop_id(ctx) {
+        painter.image(
+            tex_id,
+            screen,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::from_rgb(200, 200, 200),
+        );
+        painter.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(6, 8, 12, 130));
+    } else {
+        painter.rect_filled(
+            screen,
+            0.0,
+            Color32::from_rgba_unmultiplied(10, 12, 16, 205),
+        );
+    }
     painter.text(
         Pos2::new(screen.center().x, 90.0),
         Align2::CENTER_CENTER,
@@ -202,6 +294,7 @@ fn draw_menu_backdrop(ctx: &egui::Context, title: &str) {
 #[allow(clippy::too_many_arguments)]
 fn draw_sa_hud(
     ctx: &egui::Context,
+    media: &mut UiMediaCache,
     clock: &GameClock,
     player: &PlayerEntity,
     vehicles: &VehicleManager,
@@ -251,13 +344,23 @@ fn draw_sa_hud(
         egui::StrokeKind::Inside,
     );
     if let Some(w) = player.weapons.active() {
-        painter.text(
-            w_box.center() - Vec2::new(0.0, 6.0),
-            Align2::CENTER_CENTER,
-            &w.spec.name,
-            FontId::proportional(14.0),
-            Color32::WHITE,
-        );
+        let is_unarmed = w.spec.name.eq_ignore_ascii_case("Fist");
+        if is_unarmed && let Some(fist_id) = media.hud_sprite_id(ctx, "fist") {
+            painter.image(
+                fist_id,
+                w_box.shrink(8.0),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                w_box.center() - Vec2::new(0.0, 6.0),
+                Align2::CENTER_CENTER,
+                &w.spec.name,
+                FontId::proportional(14.0),
+                Color32::WHITE,
+            );
+        }
         if w.spec.clip_size > 0 {
             painter.text(
                 Pos2::new(w_box.center().x, w_box.max.y - 14.0),
@@ -328,38 +431,108 @@ fn draw_sa_hud(
         }
     }
 
-    // Bottom-left circular radar
+    // Bottom-left circular radar using real `radar00..radar143` tiles + `radardisc`
     if show_radar {
-        let center = Pos2::new(98.0, rect.max.y - 98.0);
-        let radius = 72.0;
-        painter.circle_filled(
-            center,
-            radius,
-            Color32::from_rgba_unmultiplied(24, 34, 42, 210),
+        let center = Pos2::new(104.0, rect.max.y - 104.0);
+        let radius = 76.0;
+        let radar_range_m = 210.0f32;
+        let scale = radius / radar_range_m;
+        let yaw = player.camera_yaw;
+        let cam_fwd = glam::Vec2::new(yaw.cos(), yaw.sin());
+        let cam_right = glam::Vec2::new(yaw.sin(), -yaw.cos());
+        let world_to_radar = |wx: f32, wy: f32| -> Pos2 {
+            let d = glam::Vec2::new(wx - player.position.x, wy - player.position.y);
+            Pos2::new(
+                center.x + d.dot(cam_right) * scale,
+                center.y - d.dot(cam_fwd) * scale,
+            )
+        };
+
+        painter.circle_filled(center, radius - 2.0, Color32::from_rgb(48, 86, 118));
+
+        let min_col = (((player.position.x - radar_range_m - 20.0) + 3000.0) / 500.0)
+            .floor()
+            .clamp(0.0, 11.0) as usize;
+        let max_col = (((player.position.x + radar_range_m + 20.0) + 3000.0) / 500.0)
+            .floor()
+            .clamp(0.0, 11.0) as usize;
+        let min_row = ((3000.0 - (player.position.y + radar_range_m + 20.0)) / 500.0)
+            .floor()
+            .clamp(0.0, 11.0) as usize;
+        let max_row = ((3000.0 - (player.position.y - radar_range_m - 20.0)) / 500.0)
+            .floor()
+            .clamp(0.0, 11.0) as usize;
+
+        for row in min_row..=max_row {
+            for col in min_col..=max_col {
+                let tile_idx = row * 12 + col;
+                if let Some(tex_id) = media.radar_tile_id(ctx, tile_idx) {
+                    let x0 = -3000.0 + (col as f32) * 500.0;
+                    let x1 = x0 + 500.0;
+                    let y0 = 3000.0 - (row as f32) * 500.0;
+                    let y1 = y0 - 500.0;
+                    let quad = [
+                        (world_to_radar(x0, y0), Pos2::new(0.0, 0.0)),
+                        (world_to_radar(x1, y0), Pos2::new(1.0, 0.0)),
+                        (world_to_radar(x1, y1), Pos2::new(1.0, 1.0)),
+                        (world_to_radar(x0, y1), Pos2::new(0.0, 1.0)),
+                    ];
+                    if let Some(mesh) =
+                        clip_quad_to_circle_mesh(&quad, center, radius - 3.5, tex_id)
+                    {
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                }
+            }
+        }
+
+        if let Some(disc_id) = media.hud_sprite_id(ctx, "radardisc") {
+            let disc_rect = Rect::from_center_size(center, Vec2::splat(radius * 2.08));
+            painter.image(
+                disc_id,
+                disc_rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.circle_stroke(center, radius, Stroke::new(4.0, Color32::BLACK));
+            painter.circle_stroke(
+                center,
+                radius - 2.0,
+                Stroke::new(1.5, Color32::from_rgb(180, 180, 180)),
+            );
+        }
+
+        // North blip on radar perimeter
+        let north_pos = Pos2::new(
+            center.x + cam_right.y * (radius - 2.0),
+            center.y - cam_fwd.y * (radius - 2.0),
         );
-        painter.circle_stroke(center, radius, Stroke::new(4.0, Color32::BLACK));
-        painter.circle_stroke(
-            center,
-            radius - 2.0,
-            Stroke::new(1.5, Color32::from_rgb(180, 180, 180)),
-        );
-        // North tick
-        painter.text(
-            center - Vec2::new(0.0, radius - 4.0),
-            Align2::CENTER_CENTER,
-            "N",
-            FontId::monospace(12.0),
-            Color32::WHITE,
-        );
+        if let Some(north_id) = media.hud_sprite_id(ctx, "radar_north") {
+            painter.image(
+                north_id,
+                Rect::from_center_size(north_pos, Vec2::splat(16.0)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                north_pos,
+                Align2::CENTER_CENTER,
+                "N",
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+        }
+
         // Nearby vehicles on radar
-        let scale = 0.25f32;
         for v in &vehicles.vehicles {
-            let rel = (v.position - player.position).truncate() * scale;
-            if rel.length() < radius - 8.0 {
-                painter.circle_filled(
-                    Pos2::new(center.x + rel.x, center.y - rel.y),
-                    3.0,
-                    Color32::from_rgb(130, 200, 255),
+            let p = world_to_radar(v.position.x, v.position.y);
+            if p.distance(center) < radius - 9.0 {
+                painter.rect_filled(
+                    Rect::from_center_size(p, Vec2::splat(4.5)),
+                    0.0,
+                    Color32::from_rgb(140, 210, 255),
                 );
             }
         }
@@ -368,9 +541,8 @@ fn draw_sa_hud(
             if e.target_interior != player.interior {
                 continue;
             }
-            let rel = (glam::Vec3::from_array(e.entrance) - player.position).truncate() * scale;
-            if rel.length() < radius - 8.0 {
-                let p = Pos2::new(center.x + rel.x, center.y - rel.y);
+            let p = world_to_radar(e.entrance[0], e.entrance[1]);
+            if p.distance(center) < radius - 9.0 {
                 painter.rect_filled(
                     Rect::from_center_size(p, Vec2::splat(5.0)),
                     0.0,
@@ -380,20 +552,36 @@ fn draw_sa_hud(
         }
         // Mission target blip
         if let Some(target) = missions.current_target_position() {
-            let rel = (target - player.position).truncate() * scale;
-            let clamped = if rel.length() > radius - 6.0 {
-                rel.normalize() * (radius - 6.0)
+            let p = world_to_radar(target.x, target.y);
+            let delta = p - center;
+            let dist = delta.length();
+            let clamped = if dist > radius - 6.0 {
+                center + delta * ((radius - 6.0) / dist.max(1e-3))
             } else {
-                rel
+                p
             };
-            painter.circle_filled(
-                Pos2::new(center.x + clamped.x, center.y - clamped.y),
-                5.0,
-                Color32::from_rgb(245, 205, 45),
-            );
+            if let Some(cj_id) = media.hud_sprite_id(ctx, "radar_sweet") {
+                painter.image(
+                    cj_id,
+                    Rect::from_center_size(clamped, Vec2::splat(16.0)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                painter.circle_filled(clamped, 5.0, Color32::from_rgb(245, 205, 45));
+            }
         }
-        // Player arrow
-        painter.circle_filled(center, 4.5, Color32::WHITE);
+        // Player centre blip (rotated triangle pointing up along camera heading)
+        if let Some(centre_id) = media.hud_sprite_id(ctx, "radar_centre") {
+            painter.image(
+                centre_id,
+                Rect::from_center_size(center, Vec2::splat(14.0)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.circle_filled(center, 4.5, Color32::WHITE);
+        }
     }
 
     // Bottom-right zone & vehicle/radio popup
@@ -473,15 +661,34 @@ fn draw_map_screen(
     missions: &MissionManager,
     actions: &mut UiActionQueue,
 ) {
-    draw_menu_backdrop(ctx, "SAN ANDREAS MAP");
+    draw_menu_backdrop(ctx, &mut ui_state.media, "SAN ANDREAS MAP");
     egui::Window::new("San Andreas Map")
         .anchor(Align2::CENTER_CENTER, [0.0, 20.0])
         .resizable(false)
         .show(ctx, |ui| {
             let (resp, painter) =
-                ui.allocate_painter(Vec2::new(420.0, 420.0), egui::Sense::hover());
+                ui.allocate_painter(Vec2::new(480.0, 480.0), egui::Sense::hover());
             let r = resp.rect;
             painter.rect_filled(r, 4.0, Color32::from_rgb(25, 48, 72));
+
+            let tile_w = r.width() / 12.0;
+            let tile_h = r.height() / 12.0;
+            for row in 0..12usize {
+                for col in 0..12usize {
+                    if let Some(tex_id) = ui_state.media.radar_tile_id(ctx, row * 12 + col) {
+                        let trect = Rect::from_min_size(
+                            Pos2::new(r.min.x + col as f32 * tile_w, r.min.y + row as f32 * tile_h),
+                            Vec2::new(tile_w + 0.4, tile_h + 0.4),
+                        );
+                        painter.image(
+                            tex_id,
+                            trect,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            }
 
             let map_pt = |wx: f32, wy: f32| -> Pos2 {
                 let nx = (wx + 3000.0) / 6000.0;
@@ -500,7 +707,7 @@ fn draw_map_screen(
                     Align2::CENTER_CENTER,
                     name,
                     FontId::proportional(14.0),
-                    Color32::from_rgb(180, 210, 180),
+                    Color32::from_rgb(235, 240, 225),
                 );
             }
 
@@ -514,23 +721,29 @@ fn draw_map_screen(
             }
 
             // Player position
-            painter.circle_filled(
-                map_pt(player.position.x, player.position.y),
-                6.0,
-                Color32::from_rgb(255, 60, 60),
-            );
+            let cj_pos = map_pt(player.position.x, player.position.y);
+            if let Some(cj_id) = ui_state.media.hud_sprite_id(ctx, "radar_cj") {
+                painter.image(
+                    cj_id,
+                    Rect::from_center_size(cj_pos, Vec2::splat(16.0)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                painter.circle_filled(cj_pos, 6.0, Color32::from_rgb(255, 60, 60));
+            }
 
             ui.horizontal(|ui| {
                 if ui.button("Teleport: Los Santos").clicked() {
-                    actions.teleport_to = Some(glam::Vec3::new(2495.3, -1688.2, 2.0));
+                    actions.teleport_to = Some(glam::Vec3::new(2495.3, -1688.2, 14.0));
                     ui_state.screen = ScreenState::Playing;
                 }
                 if ui.button("Teleport: San Fierro").clicked() {
-                    actions.teleport_to = Some(glam::Vec3::new(-2026.0, 156.0, 2.0));
+                    actions.teleport_to = Some(glam::Vec3::new(-2026.0, 156.0, 30.0));
                     ui_state.screen = ScreenState::Playing;
                 }
                 if ui.button("Teleport: Las Venturas").clicked() {
-                    actions.teleport_to = Some(glam::Vec3::new(2170.0, 1285.0, 2.0));
+                    actions.teleport_to = Some(glam::Vec3::new(2170.0, 1285.0, 12.0));
                     ui_state.screen = ScreenState::Playing;
                 }
                 if ui.button("Back").clicked() {
@@ -540,12 +753,92 @@ fn draw_map_screen(
         });
 }
 
+/// Sutherland-Hodgman clip a rotated map tile quad against an inscribed 16-gon circle.
+fn clip_quad_to_circle_mesh(
+    quad: &[(Pos2, Pos2); 4],
+    center: Pos2,
+    radius: f32,
+    texture_id: TextureId,
+) -> Option<egui::Mesh> {
+    let mut poly: Vec<(Pos2, Pos2)> = quad.to_vec();
+    const EDGES: usize = 16;
+    for i in 0..EDGES {
+        if poly.is_empty() {
+            return None;
+        }
+        let a0 = (i as f32 / EDGES as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / EDGES as f32) * std::f32::consts::TAU;
+        let p0 = Pos2::new(center.x + radius * a0.cos(), center.y + radius * a0.sin());
+        let p1 = Pos2::new(center.x + radius * a1.cos(), center.y + radius * a1.sin());
+        // Inward half-plane relative to circle center
+        let ex = p1.x - p0.x;
+        let ey = p1.y - p0.y;
+        let center_side = ex * (center.y - p0.y) - ey * (center.x - p0.x);
+        let sign = if center_side >= 0.0 { 1.0 } else { -1.0 };
+        let signed_dist = |pt: Pos2| -> f32 { (ex * (pt.y - p0.y) - ey * (pt.x - p0.x)) * sign };
+
+        let mut next = Vec::with_capacity(poly.len() + 2);
+        let len = poly.len();
+        for j in 0..len {
+            let (curr_p, curr_uv) = poly[j];
+            let (prev_p, prev_uv) = poly[(j + len - 1) % len];
+            let dc = signed_dist(curr_p);
+            let dp = signed_dist(prev_p);
+            if dc >= 0.0 {
+                if dp < 0.0 {
+                    let t = (dp / (dp - dc)).clamp(0.0, 1.0);
+                    next.push((
+                        Pos2::new(
+                            prev_p.x + (curr_p.x - prev_p.x) * t,
+                            prev_p.y + (curr_p.y - prev_p.y) * t,
+                        ),
+                        Pos2::new(
+                            prev_uv.x + (curr_uv.x - prev_uv.x) * t,
+                            prev_uv.y + (curr_uv.y - prev_uv.y) * t,
+                        ),
+                    ));
+                }
+                next.push((curr_p, curr_uv));
+            } else if dp >= 0.0 {
+                let t = (dp / (dp - dc)).clamp(0.0, 1.0);
+                next.push((
+                    Pos2::new(
+                        prev_p.x + (curr_p.x - prev_p.x) * t,
+                        prev_p.y + (curr_p.y - prev_p.y) * t,
+                    ),
+                    Pos2::new(
+                        prev_uv.x + (curr_uv.x - prev_uv.x) * t,
+                        prev_uv.y + (curr_uv.y - prev_uv.y) * t,
+                    ),
+                ));
+            }
+        }
+        poly = next;
+    }
+
+    if poly.len() < 3 {
+        return None;
+    }
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    for &(pos, uv) in &poly {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    for i in 1..(poly.len() as u32 - 1) {
+        mesh.indices.extend_from_slice(&[0, i, i + 1]);
+    }
+    Some(mesh)
+}
+
 fn draw_settings_screen(
     ctx: &egui::Context,
     ui_state: &mut GameUiState,
     config: &mut EngineConfig,
 ) {
-    draw_menu_backdrop(ctx, "SETTINGS");
+    draw_menu_backdrop(ctx, &mut ui_state.media, "SETTINGS");
     egui::Window::new("Options")
         .anchor(Align2::CENTER_CENTER, [0.0, 20.0])
         .resizable(false)
@@ -593,7 +886,11 @@ fn draw_save_load_screen(
     actions: &mut UiActionQueue,
 ) {
     let is_save = ui_state.screen == ScreenState::SaveGame;
-    draw_menu_backdrop(ctx, if is_save { "SAVE GAME" } else { "LOAD GAME" });
+    draw_menu_backdrop(
+        ctx,
+        &mut ui_state.media,
+        if is_save { "SAVE GAME" } else { "LOAD GAME" },
+    );
     egui::Window::new("Save Slots")
         .anchor(Align2::CENTER_CENTER, [0.0, 20.0])
         .resizable(false)

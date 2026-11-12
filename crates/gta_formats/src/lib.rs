@@ -16,6 +16,7 @@ pub mod paths;
 pub mod reader;
 pub mod rw;
 pub mod scm;
+pub mod scm_opcodes;
 
 pub use error::FormatError;
 pub use img::{ImgArchive, ImgEntry};

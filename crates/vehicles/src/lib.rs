@@ -151,6 +151,12 @@ pub struct VehicleEntity {
     pub color1: [f32; 3],
     pub color2: [f32; 3],
     pub occupied_by_player: bool,
+    /// Accumulated wheel rolling rotation in radians.
+    #[serde(default)]
+    pub wheel_spin: f32,
+    /// Current front wheel steering angle in radians.
+    #[serde(default)]
+    pub steer_angle: f32,
     pub params: VehicleParams,
 }
 
@@ -320,12 +326,23 @@ impl VehicleEntity {
                 self.velocity.z = 0.0;
             }
         } else {
+            // Ground / water vehicles
+            self.wheel_spin =
+                (self.wheel_spin + (forward_speed / 0.36) * dt).rem_euclid(std::f32::consts::TAU);
+            if let Some(act) = actions {
+                let target_steer =
+                    -act.move_axis.x * (self.params.steering_rate * 0.22).clamp(0.25, 0.58);
+                self.steer_angle += (target_steer - self.steer_angle) * (10.0 * dt).min(1.0);
+            } else {
+                self.steer_angle *= (1.0 - 8.0 * dt).max(0.0);
+            }
+
             let probe = self.position + Vec3::new(0.0, 0.0, 1.5);
             let probe_dist = 2.5 + (-self.velocity.z * dt).max(0.0);
             if let Some((toi, _)) = physics.raycast(probe, Vec3::NEG_Z, probe_dist) {
                 let ground_z = probe.z - toi;
                 if ground_z <= self.position.z + 0.8
-                    && self.position.z <= ground_z + 0.05
+                    && self.position.z <= ground_z + 0.08
                     && self.velocity.z <= 0.0
                 {
                     self.position.z = ground_z;
@@ -334,6 +351,30 @@ impl VehicleEntity {
             } else if self.position.z < 0.0 {
                 self.position.z = 0.0;
                 self.velocity.z = 0.0;
+            }
+
+            // Sample front/rear & left/right wheel contact heights against `.col` to pitch/roll smoothly with hills
+            if !matches!(
+                self.params.class,
+                VehicleClass::Motorcycle | VehicleClass::Bicycle
+            ) {
+                let fwd = self.forward();
+                let pos = self.position;
+                let probe_offset = |local_x: f32, local_y: f32| -> Option<f32> {
+                    let world_off = fwd * local_y + right * local_x;
+                    let origin = pos + world_off + Vec3::new(0.0, 0.0, 1.4);
+                    physics
+                        .raycast(origin, Vec3::NEG_Z, 2.4)
+                        .map(|(d, _)| origin.z - d)
+                };
+                if let (Some(zf), Some(zb)) = (probe_offset(0.0, 1.25), probe_offset(0.0, -1.25)) {
+                    let target_pitch = ((zb - zf) / 2.5).atan().clamp(-0.55, 0.55);
+                    self.pitch += (target_pitch - self.pitch) * (9.0 * dt).min(1.0);
+                }
+                if let (Some(zl), Some(zr)) = (probe_offset(-0.8, 0.0), probe_offset(0.8, 0.0)) {
+                    let target_roll = ((zl - zr) / 1.6).atan().clamp(-0.45, 0.45);
+                    self.roll += (target_roll - self.roll) * (9.0 * dt).min(1.0);
+                }
             }
         }
     }
@@ -385,6 +426,8 @@ impl VehicleManager {
             color1: spec.color1,
             color2: [0.9, 0.9, 0.9],
             occupied_by_player: false,
+            wheel_spin: 0.0,
+            steer_angle: 0.0,
             params,
         });
         id

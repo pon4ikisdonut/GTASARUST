@@ -17,8 +17,10 @@ struct FrameUniforms {
     sun_dir: [f32; 4],
     sun_color: [f32; 4],
     ambient_color: [f32; 4],
+    ambient_obj_color: [f32; 4],
     fog_color: [f32; 4],
     fog_params: [f32; 4],
+    dn_and_extra: [f32; 4],
 }
 
 #[repr(C)]
@@ -35,12 +37,16 @@ struct GpuMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     index_count: u32,
+    bounding_radius: f32,
 }
 
+#[derive(Clone)]
 pub struct RenderInstanceBatch {
     pub mesh: GpuMeshHandle,
     pub texture_idx: usize,
     pub instances: Vec<InstanceData>,
+    pub transparent: bool,
+    pub double_sided: bool,
 }
 
 pub struct SceneRenderer {
@@ -51,6 +57,8 @@ pub struct SceneRenderer {
     depth_view: wgpu::TextureView,
     sky_pipeline: wgpu::RenderPipeline,
     world_pipeline: wgpu::RenderPipeline,
+    world_double_sided_pipeline: wgpu::RenderPipeline,
+    world_blend_pipeline: wgpu::RenderPipeline,
     frame_uniform_buf: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     sky_uniform_buf: wgpu::Buffer,
@@ -278,42 +286,36 @@ impl SceneRenderer {
                 bind_group_layouts: &[Some(&frame_uniform_layout), Some(&tex_bind_group_layout)],
                 immediate_size: 0,
             });
-        let world_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world_pipeline"),
-            layout: Some(&world_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &world_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Some(Vertex3D::LAYOUT), Some(InstanceData::LAYOUT)],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
-                front_face: wgpu::FrontFace::Ccw,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &world_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let world_pipeline = create_world_pipeline(
+            &device,
+            &world_pipeline_layout,
+            &world_shader,
+            format,
+            "world_pipeline",
+            Some(wgpu::Face::Back),
+            true,
+            wgpu::BlendState::REPLACE,
+        );
+        let world_double_sided_pipeline = create_world_pipeline(
+            &device,
+            &world_pipeline_layout,
+            &world_shader,
+            format,
+            "world_double_sided_pipeline",
+            None,
+            true,
+            wgpu::BlendState::REPLACE,
+        );
+        let world_blend_pipeline = create_world_pipeline(
+            &device,
+            &world_pipeline_layout,
+            &world_shader,
+            format,
+            "world_blend_pipeline",
+            None,
+            false,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("world_sampler"),
@@ -344,6 +346,8 @@ impl SceneRenderer {
             depth_view,
             sky_pipeline,
             world_pipeline,
+            world_double_sided_pipeline,
+            world_blend_pipeline,
             frame_uniform_buf,
             frame_bind_group,
             sky_uniform_buf,
@@ -400,6 +404,13 @@ impl SceneRenderer {
         )
     }
 
+    pub fn mesh_radius(&self, handle: GpuMeshHandle) -> f32 {
+        self.meshes
+            .get(handle.0)
+            .map(|m| m.bounding_radius)
+            .unwrap_or(15.0)
+    }
+
     pub fn update_mesh_vertices(&self, handle: GpuMeshHandle, vertices: &[Vertex3D]) {
         if let Some(gpu) = self.meshes.get(handle.0) {
             let byte_len = std::mem::size_of_val(vertices) as u64;
@@ -435,6 +446,7 @@ impl SceneRenderer {
             vertex_buffer,
             index_buffer,
             index_count: cpu.indices.len() as u32,
+            bounding_radius: cpu.bounding_radius(),
         });
         handle
     }
@@ -452,36 +464,60 @@ impl SceneRenderer {
         if width == 0 || height == 0 || rgba8.len() < needed {
             return self.white_tex;
         }
+        let max_dim = width.max(height);
+        let mip_level_count = (u32::BITS - max_dim.leading_zeros()).max(1);
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
+        // Non-sRGB surface (`Bgra8Unorm`) displays raw linear/gamma TXD texels 1:1 like SA D3D9.
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size,
-            mip_level_count: 1,
+            mip_level_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba8,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * width),
-                rows_per_image: Some(height),
-            },
-            size,
-        );
+
+        let mut mip_w = width;
+        let mut mip_h = height;
+        let mut mip_buf: Vec<u8> = Vec::new();
+        for mip_level in 0..mip_level_count {
+            let src_slice = if mip_level == 0 {
+                &rgba8[..needed]
+            } else {
+                &mip_buf
+            };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                src_slice,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * mip_w),
+                    rows_per_image: Some(mip_h),
+                },
+                wgpu::Extent3d {
+                    width: mip_w,
+                    height: mip_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            if mip_level + 1 < mip_level_count {
+                let (nw, nh, next_pixels) = downsample_rgba8_2x2(src_slice, mip_w, mip_h);
+                mip_w = nw;
+                mip_h = nh;
+                mip_buf = next_pixels;
+            }
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
@@ -539,6 +575,7 @@ impl SceneRenderer {
             sun_dir: [atmo.sun_dir.x, atmo.sun_dir.y, atmo.sun_dir.z, 0.0],
             sun_color: atmo.sun_color.to_array(),
             ambient_color: atmo.ambient_color.to_array(),
+            ambient_obj_color: atmo.ambient_obj_color.to_array(),
             fog_color: atmo.fog_color.to_array(),
             fog_params: [
                 atmo.fog_start,
@@ -546,6 +583,7 @@ impl SceneRenderer {
                 time_hours,
                 atmo.rain_intensity,
             ],
+            dn_and_extra: [atmo.dn_balance, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.frame_uniform_buf, 0, bytemuck::bytes_of(&frame_u));
@@ -580,7 +618,15 @@ impl SceneRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Pre-upload instance buffers before render pass
+        // Pre-upload instance buffers grouped into opaque, double-sided cutout, and transparent passes.
+        struct GpuBatch {
+            mesh: GpuMeshHandle,
+            texture_idx: usize,
+            buf: wgpu::Buffer,
+            count: u32,
+            transparent: bool,
+            double_sided: bool,
+        }
         let mut gpu_batches = Vec::with_capacity(batches.len());
         for b in batches {
             if b.instances.is_empty() {
@@ -593,7 +639,14 @@ impl SceneRenderer {
                     contents: bytemuck::cast_slice(&b.instances),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-            gpu_batches.push((b.mesh, b.texture_idx, buf, b.instances.len() as u32));
+            gpu_batches.push(GpuBatch {
+                mesh: b.mesh,
+                texture_idx: b.texture_idx,
+                buf,
+                count: b.instances.len() as u32,
+                transparent: b.transparent,
+                double_sided: b.double_sided,
+            });
         }
 
         let mut encoder = self
@@ -637,18 +690,41 @@ impl SceneRenderer {
             rpass.set_bind_group(0, &self.sky_bind_group, &[]);
             rpass.draw(0..3, 0..1);
 
-            // 2. Instanced world geometry pass
-            rpass.set_pipeline(&self.world_pipeline);
-            rpass.set_bind_group(0, &self.frame_bind_group, &[]);
-            for (mesh_h, tex_idx, inst_buf, count) in &gpu_batches {
-                if let (Some(mesh), Some(tex_bg)) =
-                    (self.meshes.get(mesh_h.0), self.textures.get(*tex_idx))
-                {
-                    rpass.set_bind_group(1, tex_bg, &[]);
-                    rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    rpass.set_vertex_buffer(1, inst_buf.slice(..));
-                    rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.draw_indexed(0..mesh.index_count, 0, 0..*count);
+            // 2. Instanced world geometry passes: opaque -> double-sided cutout -> transparent
+            let passes = [
+                (&self.world_pipeline, false, false),
+                (&self.world_double_sided_pipeline, false, true),
+                (&self.world_blend_pipeline, true, false),
+            ];
+            for (pipeline, want_transparent, want_double_sided) in passes {
+                let mut bound = false;
+                for batch in &gpu_batches {
+                    let matches = if want_transparent {
+                        batch.transparent
+                    } else {
+                        !batch.transparent && batch.double_sided == want_double_sided
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    if let (Some(mesh), Some(tex_bg)) = (
+                        self.meshes.get(batch.mesh.0),
+                        self.textures.get(batch.texture_idx),
+                    ) {
+                        if !bound {
+                            rpass.set_pipeline(pipeline);
+                            rpass.set_bind_group(0, &self.frame_bind_group, &[]);
+                            bound = true;
+                        }
+                        rpass.set_bind_group(1, tex_bg, &[]);
+                        rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        rpass.set_vertex_buffer(1, batch.buf.slice(..));
+                        rpass.set_index_buffer(
+                            mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        rpass.draw_indexed(0..mesh.index_count, 0, 0..batch.count);
+                    }
                 }
             }
         }
@@ -705,6 +781,82 @@ impl SceneRenderer {
 
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_world_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    label: &str,
+    cull_mode: Option<wgpu::Face>,
+    depth_write: bool,
+    blend: wgpu::BlendState,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Some(Vertex3D::LAYOUT), Some(InstanceData::LAYOUT)],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn downsample_rgba8_2x2(src: &[u8], sw: u32, sh: u32) -> (u32, u32, Vec<u8>) {
+    let nw = (sw / 2).max(1);
+    let nh = (sh / 2).max(1);
+    let mut dst = vec![0u8; (nw as usize) * (nh as usize) * 4];
+    for y in 0..nh {
+        let sy0 = (y * 2).min(sh - 1);
+        let sy1 = (sy0 + 1).min(sh - 1);
+        for x in 0..nw {
+            let sx0 = (x * 2).min(sw - 1);
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let p00 = ((sy0 * sw + sx0) * 4) as usize;
+            let p10 = ((sy0 * sw + sx1) * 4) as usize;
+            let p01 = ((sy1 * sw + sx0) * 4) as usize;
+            let p11 = ((sy1 * sw + sx1) * 4) as usize;
+            let out = ((y * nw + x) * 4) as usize;
+            for c in 0..4 {
+                let sum = u32::from(src[p00 + c])
+                    + u32::from(src[p10 + c])
+                    + u32::from(src[p01 + c])
+                    + u32::from(src[p11 + c]);
+                dst[out + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+    (nw, nh, dst)
 }
 
 fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

@@ -13,9 +13,9 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{DeviceEvent, DeviceId, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -90,6 +90,8 @@ fn main() -> Result<()> {
         egui_winit: None,
         last_frame: Instant::now(),
         fps_smooth: 60.0,
+        window_focused: true,
+        cursor_locked: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -103,6 +105,8 @@ struct WindowedApp {
     egui_winit: Option<EguiWinitState>,
     last_frame: Instant,
     fps_smooth: f32,
+    window_focused: bool,
+    cursor_locked: bool,
 }
 
 impl ApplicationHandler for WindowedApp {
@@ -135,6 +139,7 @@ impl ApplicationHandler for WindowedApp {
                         self.egui_winit = Some(egui_winit);
                         self.window = Some(win);
                         self.last_frame = Instant::now();
+                        self.sync_cursor_grab();
                     }
                     Err(err) => {
                         error!("Failed to initialize wgpu renderer: {err}");
@@ -178,9 +183,23 @@ impl ApplicationHandler for WindowedApp {
                         .handle_key_event(event.physical_key, event.state);
                 }
             }
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                self.sync_cursor_grab();
+            }
             WindowEvent::MouseInput { button, state, .. } => {
                 if !consumed_by_ui && self.game.ui_state.screen == ScreenState::Playing {
                     self.game.input.handle_mouse_button(button, state);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !consumed_by_ui && self.game.ui_state.screen == ScreenState::Playing {
+                    let scroll_y = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0) as f32,
+                    };
+                    self.game.player.camera_distance =
+                        (self.game.player.camera_distance - scroll_y * 0.6).clamp(2.2, 12.0);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -197,6 +216,7 @@ impl ApplicationHandler for WindowedApp {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event
+            && self.window_focused
             && self.game.ui_state.screen == ScreenState::Playing
             && !self.game.ui_state.show_dev_overlay
         {
@@ -214,6 +234,32 @@ impl ApplicationHandler for WindowedApp {
 }
 
 impl WindowedApp {
+    fn sync_cursor_grab(&mut self) {
+        let should_lock = self.window_focused
+            && self.game.ui_state.screen == ScreenState::Playing
+            && !self.game.ui_state.show_dev_overlay;
+        if should_lock == self.cursor_locked {
+            return;
+        }
+        let Some(win) = self.window.as_ref() else {
+            return;
+        };
+        if should_lock {
+            let grabbed = win
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| win.set_cursor_grab(CursorGrabMode::Confined))
+                .is_ok();
+            if grabbed {
+                win.set_cursor_visible(false);
+                self.cursor_locked = true;
+            }
+        } else {
+            let _ = win.set_cursor_grab(CursorGrabMode::None);
+            win.set_cursor_visible(true);
+            self.cursor_locked = false;
+        }
+    }
+
     fn tick_and_render(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().clamp(0.0001, 0.1);
@@ -222,24 +268,26 @@ impl WindowedApp {
         self.fps_smooth = self.fps_smooth * 0.92 + inst_fps * 0.08;
 
         self.game.step_frame(dt);
+        self.sync_cursor_grab();
 
         let Some(win) = self.window.as_ref() else {
             return;
         };
-        let Some(renderer) = self.renderer.as_mut() else {
+        let Some(r_info) = self.renderer.as_ref() else {
             return;
         };
+        let aspect = r_info.aspect();
+        let backend_name = r_info.backend_name.clone();
+        let adapter_name = r_info.adapter_name.clone();
         let Some(egui_winit) = self.egui_winit.as_mut() else {
             return;
         };
 
-        self.game.camera.aspect = renderer.aspect();
+        self.game.camera.aspect = aspect;
         self.game.camera.fov_radians = self.game.config.graphics.fov_degrees.to_radians();
         self.game.camera.far = self.game.config.graphics.draw_distance;
 
         let raw_input = egui_winit.take_egui_input(win.as_ref());
-        let backend_name = renderer.backend_name.clone();
-        let adapter_name = renderer.adapter_name.clone();
         let radio_name = self.game.audio.current_station().display_name.clone();
 
         let mut ui_actions = Default::default();
@@ -268,12 +316,16 @@ impl WindowedApp {
             .tessellate(full_output.shapes.clone(), pixels_per_point);
 
         self.game.apply_ui_actions(ui_actions);
+        self.sync_cursor_grab();
         if self.game.quit_requested {
             event_loop.exit();
             return;
         }
 
-        self.game.stream_nearby_render_assets(renderer, 6);
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        self.game.stream_nearby_render_assets(renderer, 24);
         self.game.update_skinned_meshes(renderer);
         let atmo = self.game.world.atmosphere(
             self.game.clock.hours_f32(),
