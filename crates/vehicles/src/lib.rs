@@ -154,6 +154,9 @@ pub struct VehicleEntity {
     /// Accumulated wheel rolling rotation in radians.
     #[serde(default)]
     pub wheel_spin: f32,
+    /// Accumulated helicopter rotor rotation in radians.
+    #[serde(default)]
+    pub rotor_spin: f32,
     /// Current front wheel steering angle in radians.
     #[serde(default)]
     pub steer_angle: f32,
@@ -274,6 +277,10 @@ impl VehicleEntity {
                     } else {
                         self.velocity.z *= (1.0 - 2.5 * dt).max(0.0);
                     }
+                    let target_pitch = -throttle * 0.22;
+                    let target_roll = steer * 0.28;
+                    self.pitch += (target_pitch - self.pitch) * (5.0 * dt).min(1.0);
+                    self.roll += (target_roll - self.roll) * (5.0 * dt).min(1.0);
                 }
                 _ => {
                     // Ground / water vehicles
@@ -309,6 +316,21 @@ impl VehicleEntity {
             }
         } else {
             self.horn_active = false;
+            if self.params.class == VehicleClass::Helicopter {
+                self.pitch *= (1.0 - 4.0 * dt).max(0.0);
+                self.roll *= (1.0 - 4.0 * dt).max(0.0);
+            }
+        }
+
+        if self.params.class == VehicleClass::Helicopter && !self.exploded {
+            let spin_speed = if self.occupied_by_player {
+                22.0
+            } else if self.engine_on {
+                10.0
+            } else {
+                0.0
+            };
+            self.rotor_spin = (self.rotor_spin + spin_speed * dt).rem_euclid(std::f32::consts::TAU);
         }
 
         // Apply aerodynamic drag and clamp to max velocity
@@ -485,6 +507,7 @@ impl VehicleManager {
             color2: [0.9, 0.9, 0.9],
             occupied_by_player: false,
             wheel_spin: 0.0,
+            rotor_spin: 0.0,
             steer_angle: 0.0,
             exploded: false,
             params,

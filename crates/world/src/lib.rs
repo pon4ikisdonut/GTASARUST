@@ -9,7 +9,7 @@ use gtasarust_gta_formats::{
     dat::{GtaDat, TimecycDat, WaterDat, WaterQuad},
     ide::{IdeFile, IdeObjectDef, IdePedDef, IdeVehicleDef},
     img::ImgArchive,
-    ipl::{IplCarSpawn, IplEntryExit, IplFile, IplInstance, IplZoneBox},
+    ipl::{IplCarSpawn, IplEntryExit, IplFile, IplGarage, IplInstance, IplZoneBox},
     paths::PathsFile,
 };
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,7 @@ pub struct WorldManager {
     pub active_sectors: HashSet<SectorCoord>,
     pub car_spawns: Vec<IplCarSpawn>,
     pub entry_exits: Vec<IplEntryExit>,
+    pub garages: Vec<IplGarage>,
     pub zones: Vec<IplZoneBox>,
     pub water_quads: Vec<WaterQuad>,
     pub timecyc: TimecycDat,
@@ -295,6 +296,7 @@ impl WorldManager {
                 raw_instances.extend(ipl.instances);
                 world.car_spawns.extend(ipl.car_spawns);
                 world.entry_exits.extend(ipl.entry_exits);
+                world.garages.extend(ipl.garages);
                 world.zones.extend(ipl.zones);
             }
         }
@@ -333,6 +335,7 @@ impl WorldManager {
                     {
                         raw_instances.extend(ipl.instances);
                         world.car_spawns.extend(ipl.car_spawns);
+                        world.garages.extend(ipl.garages);
                     }
                 }
                 for entry in col_entries {
@@ -373,6 +376,7 @@ impl WorldManager {
                         raw_instances.extend(ipl.instances);
                         world.car_spawns.extend(ipl.car_spawns);
                         world.entry_exits.extend(ipl.entry_exits);
+                        world.garages.extend(ipl.garages);
                     }
                 }
                 for entry in int_cols {
@@ -584,6 +588,58 @@ impl WorldManager {
                 && candidate.name.eq_ignore_ascii_case(&source.name)
                 && candidate.target_interior != current_interior
         })
+    }
+
+    /// World-space geometric center of a `grge` garage box.
+    pub fn garage_center(g: &IplGarage) -> Vec3 {
+        let u_x = g.front_x - g.pos1[0];
+        let u_y = g.front_y - g.pos1[1];
+        let v_x = g.pos2[0] - g.pos1[0];
+        let v_y = g.pos2[1] - g.pos1[1];
+        Vec3::new(
+            g.pos1[0] + 0.5 * (u_x + v_x),
+            g.pos1[1] + 0.5 * (u_y + v_y),
+            0.5 * (g.pos1[2] + g.pos2[2]),
+        )
+    }
+
+    /// Returns whether `pos` falls within the oriented `grge` parallelogram expanded by `margin` meters.
+    pub fn is_pos_inside_garage(g: &IplGarage, pos: Vec3, margin: f32) -> bool {
+        let z_min = g.pos1[2].min(g.pos2[2]) - 1.5;
+        let z_max = g.pos1[2].max(g.pos2[2]) + 2.0;
+        if pos.z < z_min || pos.z > z_max {
+            return false;
+        }
+        let ux = g.front_x - g.pos1[0];
+        let uy = g.front_y - g.pos1[1];
+        let vx = g.pos2[0] - g.pos1[0];
+        let vy = g.pos2[1] - g.pos1[1];
+        let det = ux * vy - uy * vx;
+        if det.abs() < 1e-3 {
+            return Self::garage_center(g).distance(pos) <= 5.0 + margin;
+        }
+        let dx = pos.x - g.pos1[0];
+        let dy = pos.y - g.pos1[1];
+        let s = (dx * vy - dy * vx) / det;
+        let t = (ux * dy - uy * dx) / det;
+        let u_len = (ux * ux + uy * uy).sqrt().max(1.0);
+        let v_len = (vx * vx + vy * vy).sqrt().max(1.0);
+        let ms = margin / u_len;
+        let mt = margin / v_len;
+        (-ms..=1.0 + ms).contains(&s) && (-mt..=1.0 + mt).contains(&t)
+    }
+
+    /// Returns the matching `grge` garage containing `pos` (expanded by `margin` meters).
+    pub fn garage_at(&self, pos: Vec3, margin: f32) -> Option<(usize, &IplGarage)> {
+        self.garages
+            .iter()
+            .enumerate()
+            .find(|(_, g)| Self::is_pos_inside_garage(g, pos, margin))
+    }
+
+    /// Iterate all Pay 'n' Spray garages (`garage_type == 5`) loaded from IPLs.
+    pub fn pay_n_spray_garages(&self) -> impl Iterator<Item = &IplGarage> {
+        self.garages.iter().filter(|g| g.garage_type == 5)
     }
 
     /// Resolve current San Andreas region/zone name for a world coordinate.

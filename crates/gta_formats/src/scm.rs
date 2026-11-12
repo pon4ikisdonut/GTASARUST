@@ -106,6 +106,7 @@ pub struct ScmDecodedInstruction {
     pub next_offset: usize,
     pub opcode: u16,
     pub not_flag: bool,
+    pub is_condition: bool,
     pub name: &'static str,
     pub args: Vec<ScmArg>,
 }
@@ -255,177 +256,186 @@ impl ScmImage {
         &self,
         offset: usize,
     ) -> Result<ScmDecodedInstruction, FormatError> {
-        if offset + 2 > self.data.len() {
-            return Err(FormatError::UnexpectedEof {
-                offset,
-                needed: 2,
-                remaining: self.data.len().saturating_sub(offset),
-            });
+        decode_instruction_slice(&self.data, offset)
+    }
+}
+
+/// Decode a single SCM instruction directly from any compiled script byte buffer
+/// (`main.scm` or an extracted external `.scm` module from `script.img`).
+pub fn decode_instruction_slice(
+    data: &[u8],
+    offset: usize,
+) -> Result<ScmDecodedInstruction, FormatError> {
+    if offset + 2 > data.len() {
+        return Err(FormatError::UnexpectedEof {
+            offset,
+            needed: 2,
+            remaining: data.len().saturating_sub(offset),
+        });
+    }
+    let op_raw = u16::from_le_bytes([data[offset], data[offset + 1]]);
+    let opcode = op_raw & 0x7FFF;
+    let not_flag = (op_raw & 0x8000) != 0;
+    let Some(meta) = lookup_opcode_meta(opcode) else {
+        return Err(FormatError::Malformed {
+            context: "main.scm".to_string(),
+            detail: format!("unknown opcode 0x{opcode:04X} at offset {offset}"),
+        });
+    };
+
+    let mut pos = offset + 2;
+    let mut args = Vec::new();
+    match meta.shape {
+        OpcodeShape::Fixed(count) => {
+            for _ in 0..count {
+                let arg = read_typed_arg_from(data, &mut pos)?;
+                args.push(arg);
+            }
         }
-        let op_raw = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]);
-        let opcode = op_raw & 0x7FFF;
-        let not_flag = (op_raw & 0x8000) != 0;
-        let Some(meta) = lookup_opcode_meta(opcode) else {
+        OpcodeShape::VarArgTerminated => {
+            let first = read_typed_arg_from(data, &mut pos)?;
+            args.push(first);
+            while pos < data.len() {
+                if data[pos] == 0 {
+                    pos += 1;
+                    break;
+                }
+                let extra = read_typed_arg_from(data, &mut pos)?;
+                args.push(extra);
+            }
+        }
+        OpcodeShape::SwitchTable => {
+            // Both SWITCH_START (0x0871) and SWITCH_CONTINUED (0x0872) encode 18 typed parameters.
+            for _ in 0..18 {
+                let arg = read_typed_arg_from(data, &mut pos)?;
+                args.push(arg);
+            }
+        }
+    }
+
+    Ok(ScmDecodedInstruction {
+        offset,
+        next_offset: pos,
+        opcode,
+        not_flag,
+        is_condition: meta.is_condition,
+        name: meta.name,
+        args,
+    })
+}
+
+fn read_typed_arg_from(data: &[u8], pos: &mut usize) -> Result<ScmArg, FormatError> {
+    if *pos >= data.len() {
+        return Err(FormatError::UnexpectedEof {
+            offset: *pos,
+            needed: 1,
+            remaining: 0,
+        });
+    }
+    let ty = data[*pos];
+    *pos += 1;
+    let need = |p: usize, n: usize, len: usize| -> Result<(), FormatError> {
+        if p + n > len {
+            Err(FormatError::UnexpectedEof {
+                offset: p,
+                needed: n,
+                remaining: len.saturating_sub(p),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    let len = data.len();
+    let arg = match ty {
+        1 => {
+            need(*pos, 4, len)?;
+            let v = i32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            ScmArg::Int(v)
+        }
+        2 | 3 | 10 | 11 | 16 | 17 => {
+            need(*pos, 2, len)?;
+            let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+            *pos += 2;
+            match ty {
+                2 => ScmArg::GlobalVar(v),
+                3 => ScmArg::LocalVar(v),
+                10 => ScmArg::GlobalShortStringVar(v),
+                11 => ScmArg::LocalShortStringVar(v),
+                16 => ScmArg::GlobalLongStringVar(v),
+                _ => ScmArg::LocalLongStringVar(v),
+            }
+        }
+        4 => {
+            need(*pos, 1, len)?;
+            let v = i32::from(data[*pos] as i8);
+            *pos += 1;
+            ScmArg::Int(v)
+        }
+        5 => {
+            need(*pos, 2, len)?;
+            let v = i32::from(i16::from_le_bytes([data[*pos], data[*pos + 1]]));
+            *pos += 2;
+            ScmArg::Int(v)
+        }
+        6 => {
+            need(*pos, 4, len)?;
+            let v = f32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            ScmArg::Float(v)
+        }
+        7 | 8 | 12 | 13 | 18 | 19 => {
+            need(*pos, 6, len)?;
+            let arr = ScmArrayRef {
+                base_offset: u16::from_le_bytes([data[*pos], data[*pos + 1]]),
+                index_var: u16::from_le_bytes([data[*pos + 2], data[*pos + 3]]),
+                array_size: data[*pos + 4],
+                elem_type: data[*pos + 5] & 0x7F,
+                index_is_global: (data[*pos + 5] & 0x80) != 0,
+            };
+            *pos += 6;
+            match ty {
+                7 => ScmArg::GlobalArray(arr),
+                8 => ScmArg::LocalArray(arr),
+                12 => ScmArg::GlobalShortStringArray(arr),
+                13 => ScmArg::LocalShortStringArray(arr),
+                18 => ScmArg::GlobalLongStringArray(arr),
+                _ => ScmArg::LocalLongStringArray(arr),
+            }
+        }
+        9 => {
+            need(*pos, 8, len)?;
+            let s = decode_fixed_cstr(&data[*pos..*pos + 8]);
+            *pos += 8;
+            ScmArg::StaticShortString(s)
+        }
+        14 => {
+            need(*pos, 1, len)?;
+            let slen = usize::from(data[*pos]);
+            *pos += 1;
+            need(*pos, slen, len)?;
+            let s = String::from_utf8_lossy(&data[*pos..*pos + slen]).into_owned();
+            *pos += slen;
+            ScmArg::VariableString(s)
+        }
+        15 => {
+            need(*pos, 16, len)?;
+            let s = decode_fixed_cstr(&data[*pos..*pos + 16]);
+            *pos += 16;
+            ScmArg::StaticLongString(s)
+        }
+        other => {
             return Err(FormatError::Malformed {
                 context: "main.scm".to_string(),
-                detail: format!("unknown opcode 0x{opcode:04X} at offset {offset}"),
-            });
-        };
-
-        let mut pos = offset + 2;
-        let mut args = Vec::new();
-        match meta.shape {
-            OpcodeShape::Fixed(count) => {
-                for _ in 0..count {
-                    let arg = self.read_typed_arg(&mut pos)?;
-                    args.push(arg);
-                }
-            }
-            OpcodeShape::VarArgTerminated => {
-                let first = self.read_typed_arg(&mut pos)?;
-                args.push(first);
-                while pos < self.data.len() {
-                    if self.data[pos] == 0 {
-                        pos += 1;
-                        break;
-                    }
-                    let extra = self.read_typed_arg(&mut pos)?;
-                    args.push(extra);
-                }
-            }
-            OpcodeShape::SwitchTable => {
-                // First argument is the switch target expression, followed by case count + cases.
-                let val_arg = self.read_typed_arg(&mut pos)?;
-                args.push(val_arg);
-                if pos < self.data.len() {
-                    let _ = self.read_typed_arg(&mut pos);
-                }
-            }
-        }
-
-        Ok(ScmDecodedInstruction {
-            offset,
-            next_offset: pos,
-            opcode,
-            not_flag,
-            name: meta.name,
-            args,
-        })
-    }
-
-    fn read_typed_arg(&self, pos: &mut usize) -> Result<ScmArg, FormatError> {
-        if *pos >= self.data.len() {
-            return Err(FormatError::UnexpectedEof {
-                offset: *pos,
-                needed: 1,
-                remaining: 0,
+                detail: format!(
+                    "invalid SCM argument type 0x{other:02X} at offset {}",
+                    *pos - 1
+                ),
             });
         }
-        let ty = self.data[*pos];
-        *pos += 1;
-        let need = |p: usize, n: usize, len: usize| -> Result<(), FormatError> {
-            if p + n > len {
-                Err(FormatError::UnexpectedEof {
-                    offset: p,
-                    needed: n,
-                    remaining: len.saturating_sub(p),
-                })
-            } else {
-                Ok(())
-            }
-        };
-
-        let len = self.data.len();
-        let arg = match ty {
-            1 => {
-                need(*pos, 4, len)?;
-                let v = i32::from_le_bytes(self.data[*pos..*pos + 4].try_into().unwrap());
-                *pos += 4;
-                ScmArg::Int(v)
-            }
-            2 | 3 | 10 | 11 | 16 | 17 => {
-                need(*pos, 2, len)?;
-                let v = u16::from_le_bytes([self.data[*pos], self.data[*pos + 1]]);
-                *pos += 2;
-                match ty {
-                    2 => ScmArg::GlobalVar(v),
-                    3 => ScmArg::LocalVar(v),
-                    10 => ScmArg::GlobalShortStringVar(v),
-                    11 => ScmArg::LocalShortStringVar(v),
-                    16 => ScmArg::GlobalLongStringVar(v),
-                    _ => ScmArg::LocalLongStringVar(v),
-                }
-            }
-            4 => {
-                need(*pos, 1, len)?;
-                let v = i32::from(self.data[*pos] as i8);
-                *pos += 1;
-                ScmArg::Int(v)
-            }
-            5 => {
-                need(*pos, 2, len)?;
-                let v = i32::from(i16::from_le_bytes([self.data[*pos], self.data[*pos + 1]]));
-                *pos += 2;
-                ScmArg::Int(v)
-            }
-            6 => {
-                need(*pos, 4, len)?;
-                let v = f32::from_le_bytes(self.data[*pos..*pos + 4].try_into().unwrap());
-                *pos += 4;
-                ScmArg::Float(v)
-            }
-            7 | 8 | 12 | 13 | 18 | 19 => {
-                need(*pos, 6, len)?;
-                let arr = ScmArrayRef {
-                    base_offset: u16::from_le_bytes([self.data[*pos], self.data[*pos + 1]]),
-                    index_var: u16::from_le_bytes([self.data[*pos + 2], self.data[*pos + 3]]),
-                    array_size: self.data[*pos + 4],
-                    elem_type: self.data[*pos + 5] & 0x7F,
-                    index_is_global: (self.data[*pos + 5] & 0x80) != 0,
-                };
-                *pos += 6;
-                match ty {
-                    7 => ScmArg::GlobalArray(arr),
-                    8 => ScmArg::LocalArray(arr),
-                    12 => ScmArg::GlobalShortStringArray(arr),
-                    13 => ScmArg::LocalShortStringArray(arr),
-                    18 => ScmArg::GlobalLongStringArray(arr),
-                    _ => ScmArg::LocalLongStringArray(arr),
-                }
-            }
-            9 => {
-                need(*pos, 8, len)?;
-                let s = decode_fixed_cstr(&self.data[*pos..*pos + 8]);
-                *pos += 8;
-                ScmArg::StaticShortString(s)
-            }
-            14 => {
-                need(*pos, 1, len)?;
-                let slen = usize::from(self.data[*pos]);
-                *pos += 1;
-                need(*pos, slen, len)?;
-                let s = String::from_utf8_lossy(&self.data[*pos..*pos + slen]).into_owned();
-                *pos += slen;
-                ScmArg::VariableString(s)
-            }
-            15 => {
-                need(*pos, 16, len)?;
-                let s = decode_fixed_cstr(&self.data[*pos..*pos + 16]);
-                *pos += 16;
-                ScmArg::StaticLongString(s)
-            }
-            other => {
-                return Err(FormatError::Malformed {
-                    context: "main.scm".to_string(),
-                    detail: format!(
-                        "invalid SCM argument type 0x{other:02X} at offset {}",
-                        *pos - 1
-                    ),
-                });
-            }
-        };
-        Ok(arg)
-    }
+    };
+    Ok(arg)
 }
 
 fn decode_fixed_cstr(bytes: &[u8]) -> String {
@@ -559,5 +569,20 @@ mod tests {
         let i2 = img.decode_instruction_at(i1.next_offset).unwrap();
         assert_eq!(i2.opcode, 0x0001);
         assert_eq!(i2.args[0].as_i32_literal(), Some(0));
+
+        // SWITCH_START (0x0871) must consume all 18 typed parameters cleanly.
+        let mut sw = vec![
+            0x71, 0x08, 0x02, 0x10, 0x0B, 0x04, 0x01, 0x04, 0x00, 0x01, 0x30, 0x00, 0x00, 0x00,
+        ];
+        for case_idx in 0..7i8 {
+            sw.extend_from_slice(&[0x04, case_idx as u8, 0x01, 0x40, 0x00, 0x00, 0x00]);
+        }
+        sw.extend_from_slice(&[0x56, 0x02, 0x02, 0x08, 0x00]); // 0x0256 IS_PLAYER_PLAYING
+        let sw_instr = decode_instruction_slice(&sw, 0).unwrap();
+        assert_eq!(sw_instr.opcode, 0x0871);
+        assert_eq!(sw_instr.args.len(), 18);
+        let next_instr = decode_instruction_slice(&sw, sw_instr.next_offset).unwrap();
+        assert_eq!(next_instr.opcode, 0x0256);
+        assert!(next_instr.is_condition);
     }
 }

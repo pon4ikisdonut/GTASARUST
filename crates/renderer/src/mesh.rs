@@ -83,11 +83,25 @@ impl InstanceData {
     }
 }
 
-/// Extracted body, shared wheel geometry, and dummy wheel mounts for a GTA:SA vehicle `.dff`.
+/// Extracted body, shared wheel geometry, dummy wheel mounts, and optional helicopter rotors.
 pub struct VehicleModelParts {
     pub body: Vec<DffSubMesh>,
     pub wheel: Vec<DffSubMesh>,
     pub wheel_mounts: Vec<VehicleWheelMount>,
+    pub rotors: Vec<VehicleRotorPart>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VehicleRotorMount {
+    pub offset: Vec3,
+    pub rotation: Quat,
+    pub is_tail: bool,
+    pub is_moving_blur: bool,
+}
+
+pub struct VehicleRotorPart {
+    pub mount: VehicleRotorMount,
+    pub submeshes: Vec<DffSubMesh>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,6 +498,7 @@ impl CpuMeshData {
         let mut body_order: Vec<String> = Vec::new();
         let mut wheel_groups: HashMap<String, SubMeshAccum> = HashMap::new();
         let mut wheel_order: Vec<String> = Vec::new();
+        let mut rotors: Vec<VehicleRotorPart> = Vec::new();
         let filter_variants = clump.atomics.len() > 2;
 
         for atomic in &clump.atomics {
@@ -502,6 +517,12 @@ impl CpuMeshData {
             {
                 continue;
             }
+            let is_main_rotor = matches!(
+                lower.as_str(),
+                "static_rotor" | "moving_rotor" | "mainrotor" | "rotor"
+            ) || lower.starts_with("toprotor");
+            let is_tail_rotor = matches!(lower.as_str(), "static_rotor2" | "moving_rotor2")
+                || lower.starts_with("rearrotor");
             if lower == "wheel" || lower.starts_with("wheel_") && !lower.contains("dummy") {
                 append_geometry_submeshes(
                     geom,
@@ -509,6 +530,24 @@ impl CpuMeshData {
                     &mut wheel_groups,
                     &mut wheel_order,
                 );
+            } else if is_main_rotor || is_tail_rotor {
+                let xform = frame_mats.get(frame_idx).copied().unwrap_or(Mat4::IDENTITY);
+                let (_, frame_rot, offset) = xform.to_scale_rotation_translation();
+                let mut r_groups: HashMap<String, SubMeshAccum> = HashMap::new();
+                let mut r_order: Vec<String> = Vec::new();
+                append_geometry_submeshes(geom, Mat4::IDENTITY, &mut r_groups, &mut r_order);
+                let submeshes = finalize_submesh_groups(r_order, r_groups);
+                if !submeshes.is_empty() {
+                    rotors.push(VehicleRotorPart {
+                        mount: VehicleRotorMount {
+                            offset,
+                            rotation: frame_rot,
+                            is_tail: is_tail_rotor,
+                            is_moving_blur: lower.contains("moving"),
+                        },
+                        submeshes,
+                    });
+                }
             } else {
                 let xform = frame_mats.get(frame_idx).copied().unwrap_or(Mat4::IDENTITY);
                 append_geometry_submeshes(geom, xform, &mut body_groups, &mut body_order);
@@ -542,6 +581,7 @@ impl CpuMeshData {
             body: finalize_submesh_groups(body_order, body_groups),
             wheel: finalize_submesh_groups(wheel_order, wheel_groups),
             wheel_mounts,
+            rotors,
         }
     }
 
@@ -1100,5 +1140,83 @@ mod tests {
         assert_eq!(parts.wheel_mounts.len(), 2);
         assert!(parts.wheel_mounts.iter().any(|m| m.is_front && m.is_left));
         assert!(parts.wheel_mounts.iter().any(|m| m.is_front && !m.is_left));
+        assert!(parts.rotors.is_empty());
+    }
+
+    #[test]
+    fn dff_vehicle_parts_extracts_helicopter_main_and_tail_rotors() {
+        use gtasarust_gta_formats::rw::{DffAtomic, DffMaterial, DffMeshSplit};
+
+        let tri_geom = |x: f32| DffGeometry {
+            flags: 0,
+            positions: vec![[0.0, 0.0, 0.0], [x, 0.0, 0.0], [0.0, x, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0, 0.0]; 3],
+            colors: Vec::new(),
+            night_colors: Vec::new(),
+            triangles: Vec::new(),
+            materials: vec![DffMaterial {
+                color: [255, 255, 255, 255],
+                texture_name: None,
+                alpha_name: None,
+                ambient: 1.0,
+                specular: 0.0,
+                diffuse: 1.0,
+            }],
+            splits: vec![DffMeshSplit {
+                material_index: 0,
+                indices: vec![0, 1, 2],
+            }],
+            is_tristrip: false,
+            bounding_sphere: [0.0; 4],
+            skin: None,
+        };
+
+        let make_frame = |name: &str, pos: [f32; 3], parent: i32| DffFrame {
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            position: pos,
+            parent,
+            flags: 0,
+            name: name.into(),
+            hanim_node_id: None,
+            hanim_nodes: Vec::new(),
+        };
+
+        let clump = DffClump {
+            rw_version: 0x36003,
+            frames: vec![
+                make_frame("chassis", [0.0, 0.0, 0.0], -1),
+                make_frame("moving_rotor", [0.0, 0.0, 2.2], 0),
+                make_frame("static_rotor2", [0.0, -5.0, 1.1], 0),
+            ],
+            geometries: vec![tri_geom(2.0), tri_geom(3.0), tri_geom(1.0)],
+            atomics: vec![
+                DffAtomic {
+                    frame_index: 0,
+                    geometry_index: 0,
+                    flags: 0,
+                },
+                DffAtomic {
+                    frame_index: 1,
+                    geometry_index: 1,
+                    flags: 0,
+                },
+                DffAtomic {
+                    frame_index: 2,
+                    geometry_index: 2,
+                    flags: 0,
+                },
+            ],
+        };
+
+        let parts = CpuMeshData::dff_vehicle_parts(&clump);
+        assert_eq!(parts.body.len(), 1);
+        assert_eq!(parts.rotors.len(), 2);
+        let main = parts.rotors.iter().find(|r| !r.mount.is_tail).unwrap();
+        assert!(main.mount.is_moving_blur);
+        assert!((main.mount.offset.z - 2.2).abs() < 1e-4);
+        let tail = parts.rotors.iter().find(|r| r.mount.is_tail).unwrap();
+        assert!(!tail.mount.is_moving_blur);
+        assert!((tail.mount.offset.y + 5.0).abs() < 1e-4);
     }
 }

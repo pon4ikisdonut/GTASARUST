@@ -5,6 +5,7 @@
 
 pub mod audio_cfg;
 pub mod col;
+pub mod cut;
 pub mod dat;
 pub mod error;
 pub mod gxt;

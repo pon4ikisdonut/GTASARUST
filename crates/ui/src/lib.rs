@@ -112,6 +112,8 @@ pub struct GameUiState {
     pub status_message: Option<String>,
     pub is_aiming: bool,
     pub screen_fade_alpha: f32,
+    pub widescreen: bool,
+    pub cutscene_subtitle: Option<String>,
     pub hud_visible_override: Option<bool>,
     pub radar_visible_override: Option<bool>,
     pub media: UiMediaCache,
@@ -125,6 +127,8 @@ impl Default for GameUiState {
             status_message: None,
             is_aiming: false,
             screen_fade_alpha: 0.0,
+            widescreen: false,
+            cutscene_subtitle: None,
             hud_visible_override: None,
             radar_visible_override: None,
             media: UiMediaCache::default(),
@@ -249,6 +253,12 @@ pub fn build_game_ui(
                     ui_state.is_aiming,
                 );
             }
+            let subtitle = config
+                .game
+                .subtitles
+                .then_some(ui_state.cutscene_subtitle.as_deref())
+                .flatten();
+            draw_cutscene_overlay(ctx, ui_state.widescreen, subtitle);
         }
     }
 
@@ -628,6 +638,29 @@ fn draw_sa_hud(
                 );
             }
         }
+        // Pay 'n' Spray garages on radar
+        if player.interior == 0 {
+            for g in world.pay_n_spray_garages() {
+                let c = WorldManager::garage_center(g);
+                let p = world_to_radar(c[0], c[1]);
+                if p.distance(center) < radius - 9.0 {
+                    if let Some(spray_id) = media.hud_sprite_id(ctx, "radar_spray") {
+                        painter.image(
+                            spray_id,
+                            Rect::from_center_size(p, Vec2::splat(14.0)),
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else {
+                        painter.rect_filled(
+                            Rect::from_center_size(p, Vec2::splat(7.0)),
+                            1.0,
+                            Color32::from_rgb(80, 215, 255),
+                        );
+                    }
+                }
+            }
+        }
         // Mission target blip
         if let Some(target) = missions.current_target_position() {
             let p = world_to_radar(target.x, target.y);
@@ -736,6 +769,61 @@ fn draw_sa_hud(
             bg,
             CornerRadius::same(4),
             Color32::from_rgba_unmultiplied(0, 0, 0, 155),
+        );
+        painter.galley(text_pos, galley, Color32::WHITE);
+    }
+}
+
+fn draw_cutscene_overlay(ctx: &egui::Context, widescreen: bool, subtitle: Option<&str>) {
+    if !widescreen && subtitle.is_none() {
+        return;
+    }
+    let rect = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("sa_cutscene_overlay"),
+    ));
+    if widescreen {
+        let bar_h = (rect.height() * 0.13).clamp(52.0, 118.0);
+        painter.rect_filled(
+            Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + bar_h)),
+            0.0,
+            Color32::BLACK,
+        );
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - bar_h), rect.max),
+            0.0,
+            Color32::BLACK,
+        );
+    }
+    if let Some(sub) = subtitle
+        && !sub.trim().is_empty()
+    {
+        let mut job = egui::text::LayoutJob {
+            halign: egui::Align::Center,
+            ..Default::default()
+        };
+        for span in LocalizationTable::parse_sa_rich_text(sub, [242, 242, 242]) {
+            job.append(
+                &span.text,
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::proportional(20.0),
+                    color: Color32::from_rgb(span.color[0], span.color[1], span.color[2]),
+                    ..Default::default()
+                },
+            );
+        }
+        let galley = painter.layout_job(job);
+        let text_pos = Pos2::new(
+            rect.center().x - galley.size().x * 0.5,
+            rect.max.y - 34.0 - galley.size().y,
+        );
+        let bg = Rect::from_min_size(text_pos, galley.size()).expand2(Vec2::new(14.0, 6.0));
+        painter.rect_filled(
+            bg,
+            CornerRadius::same(4),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 175),
         );
         painter.galley(text_pos, galley, Color32::WHITE);
     }

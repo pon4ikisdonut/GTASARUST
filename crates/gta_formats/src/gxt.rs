@@ -107,6 +107,18 @@ impl GxtArchive {
             .map(String::as_str)
     }
 
+    /// Look up a GXT key in `MAIN` first, then across every mission/cutscene sub-table.
+    pub fn get_any(&self, key: &str) -> Option<&str> {
+        let hash = gxt_key_hash(key);
+        if let Some(found) = self.tables.get("MAIN").and_then(|t| t.get(&hash)) {
+            return Some(found.as_str());
+        }
+        self.tables
+            .values()
+            .find_map(|t| t.get(&hash))
+            .map(String::as_str)
+    }
+
     pub fn total_entries(&self) -> usize {
         self.tables.values().map(HashMap::len).sum()
     }

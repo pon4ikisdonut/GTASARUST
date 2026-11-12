@@ -32,6 +32,21 @@ impl LocalizationTable {
         self.fallback.get(key).map(String::as_str).unwrap_or(key)
     }
 
+    /// Look up a GXT key in a preferred mission/cutscene table, falling back across all tables and fallback JSON.
+    pub fn lookup_any<'a>(&'a self, preferred_table: Option<&str>, key: &'a str) -> &'a str {
+        if let Some(gxt) = &self.gxt {
+            if let Some(tbl) = preferred_table
+                && let Some(found) = gxt.get(tbl, key)
+            {
+                return found;
+            }
+            if let Some(found) = gxt.get_any(key) {
+                return found;
+            }
+        }
+        self.fallback.get(key).map(String::as_str).unwrap_or(key)
+    }
+
     /// Parse San Andreas inline color/newline tokens (`~r~`, `~g~`, `~b~`, `~y~`, `~p~`, `~w~`, `~s~`, `~l~`, `~h~`, `~n~`)
     /// into colored text spans matching `CHudColours` from GTA: San Andreas.
     pub fn parse_sa_rich_text(input: &str, default_color: [u8; 3]) -> Vec<SaTextSpan> {

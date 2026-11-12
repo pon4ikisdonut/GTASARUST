@@ -9,6 +9,7 @@ use gtasarust_audio::{AudioEngine, SfxCue};
 use gtasarust_engine::{EngineConfig, FixedTimestep, GameClock, GameDataRoot, HostInfo};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
 use gtasarust_gta_formats::{
+    cut::CutsceneFile,
     dat::HandlingCfg,
     gxt::GxtArchive,
     ide::{
@@ -27,13 +28,13 @@ use gtasarust_missions::MissionManager;
 use gtasarust_physics::{ColliderHandle, PhysicsWorld};
 use gtasarust_renderer::{
     CameraState, DffSubMesh, GpuMeshHandle, InstanceData, RenderInstanceBatch, SceneRenderer,
-    VehicleWheelMount, Vertex3D, mesh::CpuMeshData,
+    VehicleRotorMount, VehicleWheelMount, Vertex3D, mesh::CpuMeshData,
 };
 use gtasarust_save_system::{SaveGameData, SavedWeaponSlot, read_save_slot, write_save_slot};
-use gtasarust_scripting::{ScmVm, ScmWorldCommand};
+use gtasarust_scripting::{ScmBlipKind, ScmVm, ScmWorldCommand};
 use gtasarust_ui::{GameUiState, ScreenState, UiActionQueue};
 use gtasarust_vehicles::{VehicleClass, VehicleManager, VehicleSpawnSpec};
-use gtasarust_weapons::{WeaponInventory, WeaponKind};
+use gtasarust_weapons::{WeaponInventory, WeaponKind, WeaponSpec};
 use gtasarust_world::{SectorCoord, WeatherType, WorldManager};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
@@ -56,10 +57,17 @@ pub struct CachedDffModel {
 }
 
 #[derive(Debug, Clone)]
+pub struct CachedRotorPart {
+    pub mount: VehicleRotorMount,
+    pub submeshes: Vec<CachedSubMesh>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CachedVehicleModel {
     pub body: Vec<CachedSubMesh>,
     pub wheel: Vec<CachedSubMesh>,
     pub wheel_mounts: Vec<VehicleWheelMount>,
+    pub rotors: Vec<CachedRotorPart>,
     pub min_z: f32,
 }
 
@@ -102,6 +110,8 @@ pub struct GameWorldState {
     pub gta3_archive: Option<ImgArchive>,
     pub gta_int_archive: Option<ImgArchive>,
     pub player_archive: Option<ImgArchive>,
+    pub cuts_archive: Option<ImgArchive>,
+    pub script_img_loaded: usize,
     pub handling: Option<HandlingCfg>,
     pub ped_ifp_lib: IfpPoseLibrary,
     pub cached_textures: HashMap<String, usize>,
@@ -131,7 +141,20 @@ pub struct GameWorldState {
     pub fade_rate: f32,
     pub active_explosions: Vec<(Vec3, f32)>,
     pub scm_pickups: Vec<(Vec3, i32)>,
-    pub scm_blips: Vec<(Vec3, u8)>,
+    pub scm_blips: Vec<(i32, Vec3, i32)>,
+    pub scm_checkpoints: Vec<(i32, Vec3, f32)>,
+    pub scm_cars: HashMap<i32, u64>,
+    pub scm_chars: HashMap<i32, u64>,
+    pub active_cutscene: Option<CutsceneFile>,
+    pub active_cutscene_name: Option<String>,
+    pub cutscene_playing: bool,
+    pub cutscene_time_ms: f32,
+    pub cutscene_end_ms: f32,
+    pub scripted_camera_override: bool,
+    pub scripted_camera_pos: Option<Vec3>,
+    pub scripted_camera_target: Option<Vec3>,
+    pub player_control_enabled: bool,
+    pub garage_cooldown: f32,
     pub enex_cooldown: f32,
     pub enex_lock_pos: Option<Vec3>,
     pub interior_floor_z: Option<f32>,
@@ -149,6 +172,8 @@ impl GameWorldState {
         let mut gta3_archive = None;
         let mut gta_int_archive = None;
         let mut player_archive = None;
+        let mut cuts_archive = None;
+        let mut script_img_loaded = 0usize;
         let mut handling = None;
         let mut opened_vfs = None;
         let mut ped_ifp_lib = IfpPoseLibrary::default();
@@ -192,6 +217,32 @@ impl GameWorldState {
                             "Loaded retail GTA:SA main.scm bytecode image"
                         );
                         scm.load_scm_image(scm_img);
+                        if let Ok(script_img_path) = vfs.resolve("data/script/script.img")
+                            && let Ok(script_img) = ImgArchive::open(&script_img_path)
+                        {
+                            let entry_names: Vec<String> = script_img
+                                .entries()
+                                .iter()
+                                .map(|e| e.name.clone())
+                                .collect();
+                            for entry_name in entry_names {
+                                if entry_name.to_ascii_lowercase().ends_with(".scm")
+                                    && let Ok(bytes) = script_img.read_entry(&entry_name)
+                                    && scm.load_streamed_script_bytes(&entry_name, bytes).is_some()
+                                {
+                                    script_img_loaded += 1;
+                                }
+                            }
+                            if script_img_loaded > 0 {
+                                info!(
+                                    streamed_scripts = script_img_loaded,
+                                    "Loaded retail GTA:SA script.img streamed scripts"
+                                );
+                            }
+                        }
+                    }
+                    if let Ok(img_path) = vfs.resolve("anim/cuts.img") {
+                        cuts_archive = ImgArchive::open(&img_path).ok();
                     }
                     if let Ok(img_path) = vfs.resolve("models/gta3.img") {
                         gta3_archive = ImgArchive::open(&img_path).ok();
@@ -303,6 +354,8 @@ impl GameWorldState {
             gta3_archive,
             gta_int_archive,
             player_archive,
+            cuts_archive,
+            script_img_loaded,
             handling,
             ped_ifp_lib,
             cached_textures: HashMap::new(),
@@ -333,6 +386,19 @@ impl GameWorldState {
             active_explosions: Vec::new(),
             scm_pickups: Vec::new(),
             scm_blips: Vec::new(),
+            scm_checkpoints: Vec::new(),
+            scm_cars: HashMap::new(),
+            scm_chars: HashMap::new(),
+            active_cutscene: None,
+            active_cutscene_name: None,
+            cutscene_playing: false,
+            cutscene_time_ms: 0.0,
+            cutscene_end_ms: 5000.0,
+            scripted_camera_override: false,
+            scripted_camera_pos: None,
+            scripted_camera_target: None,
+            player_control_enabled: true,
+            garage_cooldown: 0.0,
             enex_cooldown: 0.0,
             enex_lock_pos: None,
             interior_floor_z: None,
@@ -355,6 +421,17 @@ impl GameWorldState {
     }
 
     fn update_player_camera(&mut self) {
+        if self.scripted_camera_override {
+            if let Some(cam_pos) = self.scripted_camera_pos {
+                self.camera.position = cam_pos;
+            }
+            if let Some(cam_target) = self.scripted_camera_target {
+                self.camera.target = cam_target;
+            } else {
+                self.camera.target = self.player.position + Vec3::new(0.0, 0.0, 1.35);
+            }
+            return;
+        }
         let excluded_tag = self
             .player
             .current_vehicle
@@ -400,26 +477,54 @@ impl GameWorldState {
                 ScmWorldCommand::ForceWeather(id) => {
                     self.world.weather = weather_from_sa_id(id);
                 }
-                ScmWorldCommand::CreateCar { model_id, pos, .. } => {
+                ScmWorldCommand::CreateCar {
+                    model_id,
+                    pos,
+                    handle,
+                } => {
                     let p = Vec3::from_array(pos);
                     if self.vehicles.vehicles.len() < 48
                         && p.length_squared() > 1.0
-                        && !self
+                        && let Some(def) = self.world.vehicles.get(&(model_id as u32))
+                    {
+                        let existing_id = self
                             .vehicles
                             .vehicles
                             .iter()
-                            .any(|v| v.position.truncate().distance_squared(p.truncate()) < 16.0)
-                        && let Some(def) = self.world.vehicles.get(&(model_id as u32))
-                    {
-                        self.vehicles.spawn(VehicleSpawnSpec {
-                            model_id: model_id as u32,
-                            name: &def.handling_id,
-                            class: vehicle_class_from_ide(&def.vehicle_type),
-                            position: p,
-                            yaw: 0.0,
-                            color1: sample_sa_car_color(model_id as usize),
-                            handling: self.handling.as_ref(),
+                            .find(|v| v.position.truncate().distance_squared(p.truncate()) < 16.0)
+                            .map(|v| v.id);
+                        let vid = existing_id.unwrap_or_else(|| {
+                            self.vehicles.spawn(VehicleSpawnSpec {
+                                model_id: model_id as u32,
+                                name: &def.handling_id,
+                                class: vehicle_class_from_ide(&def.vehicle_type),
+                                position: p,
+                                yaw: 0.0,
+                                color1: sample_sa_car_color(model_id as usize),
+                                handling: self.handling.as_ref(),
+                            })
                         });
+                        self.scm_cars.insert(handle, vid);
+                        self.scm.world_snapshot.active_car_pos.insert(handle, pos);
+                    }
+                }
+                ScmWorldCommand::CreateChar {
+                    ped_type,
+                    model_id,
+                    pos,
+                    handle,
+                } => {
+                    let p = Vec3::from_array(pos);
+                    if self.ai.pedestrians.len() < 64 && p.length_squared() > 1.0 {
+                        let is_cop = ped_type == 6;
+                        let behavior = if is_cop {
+                            PedBehavior::PolicePursuit
+                        } else {
+                            PedBehavior::Idle
+                        };
+                        let ped_id = self.ai.spawn_ped(model_id as u32, p, is_cop, behavior);
+                        self.scm_chars.insert(handle, ped_id);
+                        self.scm.world_snapshot.active_char_pos.insert(handle, pos);
                     }
                 }
                 ScmWorldCommand::CreatePickup { model_id, pos, .. } => {
@@ -433,24 +538,43 @@ impl GameWorldState {
                         self.scm_pickups.push((p, model_id));
                     }
                 }
-                ScmWorldCommand::AddBlip { pos, .. } => {
+                ScmWorldCommand::AddBlip { kind, pos, handle } => {
                     let p = Vec3::from_array(pos);
-                    if self.scm_blips.len() < 64
-                        && !self
-                            .scm_blips
-                            .iter()
-                            .any(|(bp, _)| bp.distance_squared(p) < 4.0)
-                    {
-                        self.scm_blips.push((p, 0));
+                    let sprite = match kind {
+                        ScmBlipKind::Sprite(id) => id,
+                        ScmBlipKind::Coord => 0,
+                    };
+                    if let Some(existing) = self.scm_blips.iter_mut().find(|(h, ..)| *h == handle) {
+                        existing.1 = p;
+                        existing.2 = sprite;
+                    } else if self.scm_blips.len() < 64 {
+                        self.scm_blips.push((handle, p, sprite));
                     }
+                }
+                ScmWorldCommand::RemoveBlip(handle) => {
+                    self.scm_blips.retain(|(h, ..)| *h != handle);
                 }
                 ScmWorldCommand::PrintText {
                     key, duration_ms, ..
                 } => {
-                    let txt = self.localization.get("MAIN", &key).to_string();
+                    let txt = self.localization.lookup_any(None, &key).to_string();
                     if !txt.is_empty() && txt != key {
                         self.set_status(txt, (duration_ms as f32 / 1000.0).clamp(2.0, 10.0));
                     }
+                }
+                ScmWorldCommand::ClearPrints => {
+                    self.ui_state.status_message = None;
+                    self.status_message_timer = 0.0;
+                }
+                ScmWorldCommand::PrintHelp { key } => {
+                    let txt = self.localization.lookup_any(None, &key).to_string();
+                    if !txt.is_empty() && txt != key {
+                        self.set_status(txt, 5.5);
+                    }
+                }
+                ScmWorldCommand::ClearHelp => {
+                    self.ui_state.status_message = None;
+                    self.status_message_timer = 0.0;
                 }
                 ScmWorldCommand::DoFade { duration_ms, out } => {
                     self.fade_target = if out { 1.0 } else { 0.0 };
@@ -463,8 +587,211 @@ impl GameWorldState {
                 ScmWorldCommand::DisplayRadar(show) => {
                     self.ui_state.radar_visible_override = Some(show);
                 }
+                ScmWorldCommand::SetCharCoordinates { handle, pos } => {
+                    if handle == self.scm.player_actor_handle || handle == 0 {
+                        let resolved = self.resolve_scm_ground_pos(pos);
+                        self.player.position = resolved;
+                        self.player.velocity = Vec3::ZERO;
+                        self.player.current_vehicle = None;
+                        self.player.control_mode = ControlMode::OnFoot;
+                        self.player.interior = 0;
+                        self.interior_floor_z = None;
+                    } else if let Some(&ped_id) = self.scm_chars.get(&handle)
+                        && let Some(ped) = self.ai.pedestrians.iter_mut().find(|p| p.id == ped_id)
+                    {
+                        ped.position = Vec3::from_array(pos);
+                        self.scm.world_snapshot.active_char_pos.insert(handle, pos);
+                    }
+                }
+                ScmWorldCommand::SetCharHeading {
+                    handle,
+                    heading_deg,
+                } => {
+                    let yaw = (heading_deg + 90.0).to_radians();
+                    if handle == self.scm.player_actor_handle || handle == 0 {
+                        self.player.yaw = yaw;
+                    } else if let Some(&ped_id) = self.scm_chars.get(&handle)
+                        && let Some(ped) = self.ai.pedestrians.iter_mut().find(|p| p.id == ped_id)
+                    {
+                        ped.yaw = yaw;
+                    }
+                }
+                ScmWorldCommand::SetCarCoordinates { handle, pos } => {
+                    let resolved = self.resolve_scm_ground_pos(pos);
+                    if let Some(&vid) = self.scm_cars.get(&handle)
+                        && let Some(veh) = self.vehicles.get_mut(vid)
+                    {
+                        veh.position = resolved;
+                        veh.velocity = Vec3::ZERO;
+                    }
+                    self.scm
+                        .world_snapshot
+                        .active_car_pos
+                        .insert(handle, resolved.to_array());
+                }
+                ScmWorldCommand::SetPlayerControl { enabled, .. } => {
+                    self.player_control_enabled = enabled;
+                    self.scm.world_snapshot.player_control = enabled;
+                }
+                ScmWorldCommand::ToggleWidescreen(enabled) => {
+                    self.ui_state.widescreen = enabled;
+                }
+                ScmWorldCommand::AlterWantedLevel { stars, .. } => {
+                    self.player.wanted_stars = stars.clamp(0, 6);
+                    self.ai.wanted_stars = self.player.wanted_stars;
+                }
+                ScmWorldCommand::ClearWantedLevel { .. } => {
+                    self.player.wanted_stars = 0;
+                    self.ai.wanted_stars = 0;
+                    self.ai.wanted_heat = 0.0;
+                }
+                ScmWorldCommand::SetMaxWantedLevel(max_stars) => {
+                    if self.player.wanted_stars > max_stars {
+                        self.player.wanted_stars = max_stars;
+                        self.ai.wanted_stars = max_stars;
+                    }
+                }
+                ScmWorldCommand::GiveWeaponToChar {
+                    handle,
+                    weapon_type,
+                    ammo,
+                } => {
+                    if (handle == self.scm.player_actor_handle || handle == 0)
+                        && let Some(spec) = weapon_spec_from_sa_id(weapon_type)
+                    {
+                        self.player.weapons.give_weapon(spec, ammo.max(0) as u32);
+                    }
+                }
+                ScmWorldCommand::AddArmourToChar { handle, amount } => {
+                    if handle == self.scm.player_actor_handle || handle == 0 {
+                        self.player.armor =
+                            (self.player.armor + amount.max(0) as f32).clamp(0.0, 100.0);
+                    }
+                }
+                ScmWorldCommand::SetCharHealth { handle, health } => {
+                    if handle == self.scm.player_actor_handle || handle == 0 {
+                        self.player.health = (health as f32).clamp(0.0, self.player.max_health);
+                    } else if let Some(&ped_id) = self.scm_chars.get(&handle)
+                        && let Some(ped) = self.ai.pedestrians.iter_mut().find(|p| p.id == ped_id)
+                    {
+                        ped.health = health.max(0) as f32;
+                    }
+                }
+                ScmWorldCommand::SetFixedCameraPosition { pos, .. } => {
+                    self.scripted_camera_pos = Some(Vec3::from_array(pos));
+                    self.scripted_camera_override = true;
+                }
+                ScmWorldCommand::PointCameraAtPoint { pos, .. } => {
+                    self.scripted_camera_target = Some(Vec3::from_array(pos));
+                    self.scripted_camera_override = true;
+                }
+                ScmWorldCommand::PointCameraAtChar { handle, .. } => {
+                    let target = if handle == self.scm.player_actor_handle || handle == 0 {
+                        self.player.position + Vec3::new(0.0, 0.0, 1.35)
+                    } else if let Some(pos) = self.scm.world_snapshot.active_char_pos.get(&handle) {
+                        Vec3::from_array(*pos) + Vec3::new(0.0, 0.0, 1.35)
+                    } else {
+                        self.player.position + Vec3::new(0.0, 0.0, 1.35)
+                    };
+                    self.scripted_camera_target = Some(target);
+                    self.scripted_camera_override = true;
+                }
+                ScmWorldCommand::PointCameraAtCar { handle, .. } => {
+                    let target = self
+                        .scm_cars
+                        .get(&handle)
+                        .and_then(|vid| self.vehicles.get(*vid).map(|v| v.position))
+                        .or_else(|| {
+                            self.scm
+                                .world_snapshot
+                                .active_car_pos
+                                .get(&handle)
+                                .map(|p| Vec3::from_array(*p))
+                        })
+                        .unwrap_or(self.player.position);
+                    self.scripted_camera_target = Some(target + Vec3::new(0.0, 0.0, 0.85));
+                    self.scripted_camera_override = true;
+                }
+                ScmWorldCommand::RestoreCamera { .. } | ScmWorldCommand::SetCameraBehindPlayer => {
+                    self.scripted_camera_override = false;
+                    self.scripted_camera_pos = None;
+                    self.scripted_camera_target = None;
+                }
+                ScmWorldCommand::LoadCutscene(name) => {
+                    let upper = name.to_ascii_uppercase();
+                    let cut = self.read_cutscene_from_archive(&name);
+                    let end_ms = cut
+                        .as_ref()
+                        .and_then(|c| c.subtitles.iter().map(|s| s.start_ms + s.duration_ms).max())
+                        .unwrap_or(4500)
+                        .max(5000) as f32
+                        + 900.0;
+                    self.active_cutscene = cut;
+                    self.active_cutscene_name = Some(upper);
+                    self.cutscene_playing = false;
+                    self.cutscene_time_ms = 0.0;
+                    self.cutscene_end_ms = end_ms;
+                    self.ui_state.cutscene_subtitle = None;
+                    self.scm.world_snapshot.cutscene_loaded = true;
+                    self.scm.world_snapshot.cutscene_time_ms = 0;
+                    self.scm.world_snapshot.cutscene_finished = false;
+                    self.scm.world_snapshot.cutscene_skipped = false;
+                }
+                ScmWorldCommand::SetCutsceneOffset(offset) => {
+                    if let Some(cut) = &mut self.active_cutscene {
+                        cut.offset = offset;
+                    }
+                }
+                ScmWorldCommand::StartCutscene => {
+                    self.cutscene_playing = true;
+                    self.cutscene_time_ms = 0.0;
+                    self.scm.world_snapshot.cutscene_time_ms = 0;
+                    self.scm.world_snapshot.cutscene_finished = false;
+                    self.scm.world_snapshot.cutscene_skipped = false;
+                }
+                ScmWorldCommand::ClearCutscene => {
+                    self.active_cutscene = None;
+                    self.active_cutscene_name = None;
+                    self.cutscene_playing = false;
+                    self.cutscene_time_ms = 0.0;
+                    self.ui_state.cutscene_subtitle = None;
+                    self.scm.world_snapshot.cutscene_loaded = false;
+                    self.scm.world_snapshot.cutscene_time_ms = 0;
+                    self.scm.world_snapshot.cutscene_finished = false;
+                    self.scm.world_snapshot.cutscene_skipped = false;
+                }
+                ScmWorldCommand::ActivateGarage { name, active } => {
+                    self.scm
+                        .world_snapshot
+                        .garage_open
+                        .insert(name.to_ascii_lowercase(), active);
+                }
+                ScmWorldCommand::ReportMissionAudioEvent { sound_id, .. } => {
+                    if sound_id == 1052 || sound_id == 1134 {
+                        self.audio.play_sfx(SfxCue::Respray);
+                    }
+                    debug!(sound_id, "Processed SCM mission audio event");
+                }
+                ScmWorldCommand::CreateCheckpoint {
+                    pos,
+                    radius,
+                    handle,
+                    ..
+                } => {
+                    let p = Vec3::from_array(pos);
+                    if let Some(existing) =
+                        self.scm_checkpoints.iter_mut().find(|(h, ..)| *h == handle)
+                    {
+                        existing.1 = p;
+                        existing.2 = radius.max(1.0);
+                    } else if self.scm_checkpoints.len() < 32 {
+                        self.scm_checkpoints.push((handle, p, radius.max(1.0)));
+                    }
+                }
+                ScmWorldCommand::DeleteCheckpoint(handle) => {
+                    self.scm_checkpoints.retain(|(h, ..)| *h != handle);
+                }
                 ScmWorldCommand::CreatePlayer { .. }
-                | ScmWorldCommand::CreateChar { .. }
                 | ScmWorldCommand::CreateCarGenerator { .. }
                 | ScmWorldCommand::LoadScene(_)
                 | ScmWorldCommand::RequestModel(_) => {
@@ -682,12 +1009,26 @@ impl GameWorldState {
                 min_z = min_z.min(mount.offset.z + wheel_local_min_z);
             }
         }
+        let mut rotors = Vec::with_capacity(parts.rotors.len());
+        for (idx, r_part) in parts.rotors.into_iter().enumerate() {
+            let (submeshes, _, _) = self.upload_submeshes(
+                renderer,
+                &format!("{dff_name}/rotor#{idx}"),
+                r_part.submeshes,
+                &txd_chain,
+            );
+            rotors.push(CachedRotorPart {
+                mount: r_part.mount,
+                submeshes,
+            });
+        }
         self.cached_vehicle_models.insert(
             dff_name,
             CachedVehicleModel {
                 body,
                 wheel,
                 wheel_mounts: parts.wheel_mounts,
+                rotors,
                 min_z,
             },
         );
@@ -1493,6 +1834,218 @@ impl GameWorldState {
         self.status_message_timer = duration;
     }
 
+    fn read_cutscene_from_archive(&self, name: &str) -> Option<CutsceneFile> {
+        let cuts = self.cuts_archive.as_ref()?;
+        let target = format!("{}.cut", name.to_ascii_lowercase());
+        let entry_name = cuts
+            .entries()
+            .iter()
+            .find(|e| e.name.to_ascii_lowercase() == target)
+            .map(|e| e.name.clone())?;
+        let bytes = cuts.read_entry(&entry_name).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        Some(CutsceneFile::parse(&text))
+    }
+
+    fn resolve_scm_ground_pos(&mut self, pos: [f32; 3]) -> Vec3 {
+        let mut p = Vec3::from_array(pos);
+        self.world
+            .update_streaming(p, self.config.graphics.draw_distance);
+        self.sync_collision_sectors();
+        if p.z <= -90.0 {
+            p.z = self
+                .physics
+                .ground_height_below(p.x, p.y, 120.0, 260.0)
+                .map(|z| z + 0.05)
+                .unwrap_or(15.0);
+        }
+        p
+    }
+
+    fn reload_scm_scripts(&mut self) {
+        self.scm = ScmVm::default();
+        self.script_img_loaded = 0;
+        if let Some(vfs) = &self.vfs {
+            if let Ok(scm_bytes) = vfs.read_bytes("data/script/main.scm")
+                && let Ok(scm_img) = ScmImage::parse(scm_bytes)
+            {
+                self.scm.load_scm_image(scm_img);
+            }
+            if self.scm.scm_image.is_some()
+                && let Ok(script_img_path) = vfs.resolve("data/script/script.img")
+                && let Ok(script_img) = ImgArchive::open(&script_img_path)
+            {
+                let names: Vec<String> = script_img
+                    .entries()
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect();
+                for name in names {
+                    if name.to_ascii_lowercase().ends_with(".scm")
+                        && let Ok(bytes) = script_img.read_entry(&name)
+                        && self.scm.load_streamed_script_bytes(&name, bytes).is_some()
+                    {
+                        self.script_img_loaded += 1;
+                    }
+                }
+            }
+        }
+        self.active_cutscene = None;
+        self.active_cutscene_name = None;
+        self.cutscene_playing = false;
+        self.cutscene_time_ms = 0.0;
+        self.scripted_camera_override = false;
+        self.scripted_camera_pos = None;
+        self.scripted_camera_target = None;
+        self.player_control_enabled = true;
+        self.scm_cars.clear();
+        self.scm_chars.clear();
+        self.scm_blips.clear();
+        self.scm_checkpoints.clear();
+        self.ui_state.widescreen = false;
+        self.ui_state.cutscene_subtitle = None;
+        self.ui_state.hud_visible_override = None;
+        self.ui_state.radar_visible_override = None;
+    }
+
+    fn update_cutscene(&mut self, dt: f32, actions: &ActionFrameState) {
+        if !self.cutscene_playing {
+            self.ui_state.cutscene_subtitle = None;
+            return;
+        }
+        self.cutscene_time_ms += dt * 1000.0;
+        if actions.skip_cutscene_just_pressed {
+            self.scm.world_snapshot.cutscene_skipped = true;
+            self.scm.world_snapshot.cutscene_finished = true;
+            self.cutscene_playing = false;
+            self.ui_state.cutscene_subtitle = None;
+            return;
+        }
+        if self.cutscene_time_ms >= self.cutscene_end_ms {
+            self.scm.world_snapshot.cutscene_finished = true;
+            self.cutscene_playing = false;
+            self.ui_state.cutscene_subtitle = None;
+            return;
+        }
+        let t_ms = self.cutscene_time_ms as i32;
+        let active_key = self.active_cutscene.as_ref().and_then(|cut| {
+            cut.subtitles
+                .iter()
+                .find(|s| t_ms >= s.start_ms && t_ms <= s.start_ms + s.duration_ms)
+                .map(|s| s.gxt_key.clone())
+        });
+        self.ui_state.cutscene_subtitle = active_key.and_then(|key| {
+            let txt = self
+                .localization
+                .lookup_any(self.active_cutscene_name.as_deref(), &key)
+                .to_string();
+            (txt != key && !txt.is_empty()).then_some(txt)
+        });
+    }
+
+    fn sync_scm_world_snapshot(&mut self, actions: &ActionFrameState) {
+        let snap = &mut self.scm.world_snapshot;
+        snap.player_pos = self.player.position.to_array();
+        snap.player_heading_deg = self.player.yaw.to_degrees().rem_euclid(360.0);
+        snap.player_health = self.player.health as i32;
+        snap.player_in_car = self.player.control_mode == ControlMode::InVehicle;
+        snap.player_car_handle = self.player.current_vehicle.map(|vid| {
+            self.scm_cars
+                .iter()
+                .find_map(|(&h, &v)| (v == vid).then_some(h))
+                .unwrap_or(vid as i32)
+        });
+        snap.player_car_model = self
+            .player
+            .current_vehicle
+            .and_then(|vid| self.vehicles.get(vid).map(|v| v.model_id as i32));
+        snap.player_dead = self.player.life_state == PlayerLifeState::Wasted;
+        snap.player_stopped = self.player.velocity.length() < 0.15;
+        snap.player_control = self.player_control_enabled;
+        snap.fade_active = (self.fade_alpha - self.fade_target).abs() > 0.02;
+        snap.cutscene_time_ms = self.cutscene_time_ms as i32;
+        let mut buttons = [false; 24];
+        buttons[17] = actions.fire_or_attack;
+        buttons[14] = actions.jump_or_handbrake;
+        buttons[18] = actions.crouch_or_horn;
+        buttons[16] = actions.skip_cutscene_just_pressed;
+        snap.buttons_pressed = buttons;
+
+        for (&handle, &vid) in &self.scm_cars {
+            if let Some(veh) = self.vehicles.get(vid) {
+                snap.active_car_pos.insert(handle, veh.position.to_array());
+                if veh.exploded {
+                    snap.dead_cars.insert(handle);
+                } else {
+                    snap.dead_cars.remove(&handle);
+                }
+            }
+        }
+        for (&handle, &ped_id) in &self.scm_chars {
+            if let Some(ped) = self.ai.pedestrians.iter().find(|p| p.id == ped_id) {
+                snap.active_char_pos.insert(handle, ped.position.to_array());
+                if ped.health <= 0.0 {
+                    snap.dead_chars.insert(handle);
+                } else {
+                    snap.dead_chars.remove(&handle);
+                }
+            }
+        }
+    }
+
+    fn try_handle_garage_interaction(&mut self) {
+        if self.player.interior != 0 || self.garage_cooldown > 0.0 {
+            return;
+        }
+        let Some(vid) = self.player.current_vehicle else {
+            return;
+        };
+        let Some((_, garage_ref)) = self.world.garage_at(self.player.position, 1.5) else {
+            return;
+        };
+        let garage = garage_ref.clone();
+        if garage.garage_type != 5 {
+            return;
+        }
+        let Some(veh) = self.vehicles.get_mut(vid) else {
+            return;
+        };
+        if veh.exploded {
+            return;
+        }
+        let needs_service =
+            self.player.wanted_stars > 0 || self.ai.wanted_stars > 0 || veh.health < 999.0;
+        if !needs_service {
+            return;
+        }
+        if self.player.money < 100 {
+            self.garage_cooldown = 4.0;
+            self.set_status("Pay 'n' Spray: Need $100 for respray", 3.5);
+            return;
+        }
+        self.player.money -= 100;
+        veh.health = 1000.0;
+        let next_idx = (veh.id as usize)
+            .wrapping_add(usize::from(self.clock.minute))
+            .wrapping_add(1);
+        let mut new_color = sample_sa_car_color(next_idx);
+        if (new_color[0] - veh.color1[0]).abs() < 0.05
+            && (new_color[1] - veh.color1[1]).abs() < 0.05
+        {
+            new_color = sample_sa_car_color(next_idx + 1);
+        }
+        veh.color1 = new_color;
+        self.player.wanted_stars = 0;
+        self.ai.wanted_stars = 0;
+        self.ai.wanted_heat = 0.0;
+        self.audio.play_sfx(SfxCue::Respray);
+        self.garage_cooldown = 5.0;
+        self.set_status(
+            "Pay 'n' Spray: Vehicle repaired & repainted, wanted level cleared (-$100)",
+            4.5,
+        );
+    }
+
     fn try_handle_enex_transition(&mut self) {
         if let Some(lock_pos) = self.enex_lock_pos
             && self.player.position.distance_squared(lock_pos) > 2.6 * 2.6
@@ -1636,6 +2189,14 @@ impl GameWorldState {
         self.audio.update(dt);
         self.enex_cooldown = (self.enex_cooldown - dt).max(0.0);
         self.service_cooldown = (self.service_cooldown - dt).max(0.0);
+        self.garage_cooldown = (self.garage_cooldown - dt).max(0.0);
+        self.update_cutscene(dt, actions);
+        let disabled_actions = ActionFrameState::default();
+        let ctrl = if self.player_control_enabled {
+            actions
+        } else {
+            &disabled_actions
+        };
         if self.status_message_timer > 0.0 {
             self.status_message_timer -= dt;
             if self.status_message_timer <= 0.0 {
@@ -1656,7 +2217,7 @@ impl GameWorldState {
         }
         self.active_explosions.retain(|(_, ttl)| *ttl > 0.0);
 
-        if actions.enter_exit_just_pressed {
+        if ctrl.enter_exit_just_pressed {
             let was_on_foot = self.player.control_mode == ControlMode::OnFoot;
             if self.vehicles.toggle_player_entry(&mut self.player) {
                 if was_on_foot && let Some(vid) = self.player.current_vehicle {
@@ -1671,16 +2232,16 @@ impl GameWorldState {
             }
         }
 
-        if actions.radio_next && self.player.control_mode == ControlMode::InVehicle {
+        if ctrl.radio_next && self.player.control_mode == ControlMode::InVehicle {
             self.audio.cycle_radio_next();
         }
 
         self.ui_state.is_aiming =
-            self.player.control_mode == ControlMode::OnFoot && actions.aim_or_reverse;
+            self.player.control_mode == ControlMode::OnFoot && ctrl.aim_or_reverse;
 
         // Fire active weapon on foot with occluded 3D raycast against `.col`, vehicles, and peds
         if self.player.control_mode == ControlMode::OnFoot
-            && actions.fire_or_attack
+            && ctrl.fire_or_attack
             && let Some((damage, range, explosive)) = self.player.weapons.try_fire()
         {
             let shot_cue = match self.player.weapons.active().map(|w| w.spec.kind) {
@@ -1756,7 +2317,7 @@ impl GameWorldState {
         let player_water_z = (self.player.interior == 0)
             .then(|| self.world.water_height_at(self.player.position))
             .flatten();
-        self.player.update_on_foot(dt, actions, &self.physics);
+        self.player.update_on_foot(dt, ctrl, &self.physics);
         self.player.update_water_state(player_water_z, dt);
         if self.player.interior != 0
             && let Some(floor_z) = self.interior_floor_z
@@ -1768,6 +2329,7 @@ impl GameWorldState {
         }
         self.try_handle_enex_transition();
         self.try_handle_interior_service();
+        self.try_handle_garage_interaction();
         if self.player.control_mode == ControlMode::OnFoot
             && self.player.grounded
             && !self.player.in_water
@@ -1777,7 +2339,7 @@ impl GameWorldState {
         }
 
         let occupied_id = self.player.current_vehicle;
-        if occupied_id.is_some() && actions.crouch_or_horn {
+        if occupied_id.is_some() && ctrl.crouch_or_horn {
             self.audio.play_sfx(SfxCue::CarHorn);
         }
         let mut player_crash = false;
@@ -1794,7 +2356,7 @@ impl GameWorldState {
                 )
             };
             let input_for_veh = if Some(veh.id) == occupied_id {
-                Some(actions)
+                Some(ctrl)
             } else {
                 ai_action.as_ref()
             };
@@ -1821,6 +2383,24 @@ impl GameWorldState {
         if player_crash {
             self.audio.play_sfx(SfxCue::Crash);
         }
+        let (in_veh, speed_mps, is_bike, player_siren) = occupied_id
+            .and_then(|vid| self.vehicles.get(vid))
+            .map_or((false, 0.0, false, false), |v| {
+                (
+                    true,
+                    v.speed_mps(),
+                    v.params.class == VehicleClass::Bicycle,
+                    v.siren_on,
+                )
+            });
+        let nearby_siren = player_siren
+            || self.vehicles.vehicles.iter().any(|v| {
+                v.siren_on
+                    && !v.exploded
+                    && v.position.distance_squared(self.player.position) <= 55.0 * 55.0
+            });
+        self.audio
+            .update_vehicle_audio(in_veh, speed_mps, is_bike, nearby_siren, dt);
 
         self.physics.step(dt);
         self.ai.tick_world(
@@ -1831,6 +2411,7 @@ impl GameWorldState {
             &self.physics,
             &self.world.path_graph,
         );
+        self.sync_scm_world_snapshot(actions);
         self.scm.tick(dt);
         self.drain_scm_world_commands();
         self.missions.tick(dt, &mut self.player, &mut self.scm);
@@ -1869,6 +2450,8 @@ impl GameWorldState {
             self.active_enex_name = None;
             self.interior_service_pos = None;
             self.enex_lock_pos = None;
+            self.reload_scm_scripts();
+            self.drain_scm_world_commands();
             self.world
                 .update_streaming(self.player.position, self.config.graphics.draw_distance);
             self.sync_collision_sectors();
@@ -2258,6 +2841,46 @@ impl GameWorldState {
                             }
                         }
                     }
+                    if !v_model.rotors.is_empty() {
+                        let has_blur_rotor = v_model.rotors.iter().any(|r| r.mount.is_moving_blur);
+                        for rotor in &v_model.rotors {
+                            if rotor.mount.is_moving_blur && v.rotor_spin.abs() <= 0.5 {
+                                continue;
+                            }
+                            if !rotor.mount.is_moving_blur
+                                && has_blur_rotor
+                                && v.rotor_spin.abs() > 6.0
+                            {
+                                continue;
+                            }
+                            let angle = if rotor.mount.is_tail {
+                                v.rotor_spin * 1.4
+                            } else {
+                                v.rotor_spin
+                            };
+                            let spin = if rotor.mount.is_tail {
+                                Quat::from_rotation_x(angle)
+                            } else {
+                                Quat::from_rotation_z(angle)
+                            };
+                            let rotor_rot = body_rot * rotor.mount.rotation * spin;
+                            let rotor_pos = body_pos + body_rot * rotor.mount.offset;
+                            for sub in &rotor.submeshes {
+                                let transparent = sub.has_alpha_tex || sub.material_color[3] < 0.98;
+                                custom_batches
+                                    .entry((sub.mesh.0, sub.texture_idx, transparent, true))
+                                    .or_default()
+                                    .push(InstanceData::from_transform_lit(
+                                        rotor_pos,
+                                        rotor_rot,
+                                        Vec3::ONE,
+                                        sub.material_color,
+                                        1.0,
+                                        if sub.has_alpha_tex { 0.15 } else { 0.0 },
+                                    ));
+                            }
+                        }
+                    }
                 } else {
                     let scale = match v.params.class {
                         VehicleClass::Bicycle | VehicleClass::Motorcycle => {
@@ -2272,6 +2895,29 @@ impl GameWorldState {
                         scale,
                         [v.color1[0], v.color1[1], v.color1[2], 1.0],
                         1.0,
+                        0.0,
+                    ));
+                }
+                if v.siren_on && !v.exploded {
+                    let phase = ((self.timestep.total_sim_time * 10.0) as i64) & 1;
+                    let siren_base = v.position + Vec3::new(0.0, 0.0, 1.55);
+                    let right_vec = v.rotation_quat() * Vec3::Y;
+                    let red_alpha = if phase == 0 { 0.96 } else { 0.18 };
+                    let blue_alpha = if phase == 1 { 0.96 } else { 0.18 };
+                    box_instances.push(InstanceData::from_transform_lit(
+                        siren_base - right_vec * 0.42,
+                        v.rotation_quat(),
+                        Vec3::new(0.26, 0.34, 0.16),
+                        [1.0, 0.14, 0.12, red_alpha],
+                        2.0,
+                        0.0,
+                    ));
+                    box_instances.push(InstanceData::from_transform_lit(
+                        siren_base + right_vec * 0.42,
+                        v.rotation_quat(),
+                        Vec3::new(0.26, 0.34, 0.16),
+                        [0.14, 0.42, 1.0, blue_alpha],
+                        2.0,
                         0.0,
                     ));
                 }
@@ -2382,6 +3028,35 @@ impl GameWorldState {
                             spin,
                             Vec3::splat(0.75),
                             [0.20, 0.95, 0.65, 0.90],
+                            2.0,
+                            0.0,
+                        ));
+                    }
+                }
+                for g in self.world.pay_n_spray_garages() {
+                    let gp = WorldManager::garage_center(g);
+                    if gp.distance_squared(self.player.position) <= 140.0 * 140.0
+                        && frustum.intersects_sphere(gp + Vec3::Z, 3.0)
+                    {
+                        marker_instances.push(InstanceData::from_transform_lit(
+                            gp + Vec3::new(0.0, 0.0, 1.3 + bob),
+                            spin,
+                            Vec3::splat(1.25),
+                            [0.25, 0.85, 1.0, 0.88],
+                            2.0,
+                            0.0,
+                        ));
+                    }
+                }
+                for &(_, cp_pos, radius) in &self.scm_checkpoints {
+                    if cp_pos.distance_squared(self.player.position) <= 180.0 * 180.0
+                        && frustum.intersects_sphere(cp_pos + Vec3::Z, radius + 2.0)
+                    {
+                        marker_instances.push(InstanceData::from_transform_lit(
+                            cp_pos + Vec3::new(0.0, 0.0, 1.2 + bob),
+                            spin,
+                            Vec3::splat((radius * 0.4).clamp(1.0, 3.5)),
+                            [1.0, 0.22, 0.20, 0.90],
                             2.0,
                             0.0,
                         ));
@@ -2759,6 +3434,122 @@ fn weather_from_sa_id(id: i32) -> WeatherType {
     }
 }
 
+fn weapon_spec_from_sa_id(weapon_id: i32) -> Option<WeaponSpec> {
+    let spec = match weapon_id {
+        4 => WeaponSpec {
+            id: 4,
+            name: "Knife".to_string(),
+            slot: 1,
+            kind: WeaponKind::Melee,
+            damage: 25.0,
+            range: 2.4,
+            fire_interval: 0.35,
+            clip_size: 0,
+            reload_time: 0.0,
+            is_explosive: false,
+        },
+        5 => WeaponSpec {
+            id: 5,
+            name: "Baseball Bat".to_string(),
+            slot: 1,
+            kind: WeaponKind::Melee,
+            damage: 32.0,
+            range: 2.6,
+            fire_interval: 0.45,
+            clip_size: 0,
+            reload_time: 0.0,
+            is_explosive: false,
+        },
+        22 | 23 => WeaponInventory::preset_colt45(),
+        24 => WeaponSpec {
+            id: 24,
+            name: "Desert Eagle".to_string(),
+            slot: 2,
+            kind: WeaponKind::Handgun,
+            damage: 70.0,
+            range: 40.0,
+            fire_interval: 0.55,
+            clip_size: 7,
+            reload_time: 1.4,
+            is_explosive: false,
+        },
+        25..=27 => WeaponSpec {
+            id: weapon_id as u32,
+            name: "Shotgun".to_string(),
+            slot: 3,
+            kind: WeaponKind::Shotgun,
+            damage: 85.0,
+            range: 30.0,
+            fire_interval: 0.75,
+            clip_size: 8,
+            reload_time: 1.5,
+            is_explosive: false,
+        },
+        28 | 29 | 32 => WeaponSpec {
+            id: weapon_id as u32,
+            name: "MP5".to_string(),
+            slot: 4,
+            kind: WeaponKind::SubmachineGun,
+            damage: 25.0,
+            range: 45.0,
+            fire_interval: 0.10,
+            clip_size: 30,
+            reload_time: 1.3,
+            is_explosive: false,
+        },
+        30 => WeaponSpec {
+            id: 30,
+            name: "AK-47".to_string(),
+            slot: 5,
+            kind: WeaponKind::AssaultRifle,
+            damage: 35.0,
+            range: 70.0,
+            fire_interval: 0.11,
+            clip_size: 30,
+            reload_time: 1.5,
+            is_explosive: false,
+        },
+        31 => WeaponSpec {
+            id: 31,
+            name: "M4".to_string(),
+            slot: 5,
+            kind: WeaponKind::AssaultRifle,
+            damage: 38.0,
+            range: 85.0,
+            fire_interval: 0.10,
+            clip_size: 50,
+            reload_time: 1.5,
+            is_explosive: false,
+        },
+        33 | 34 => WeaponSpec {
+            id: weapon_id as u32,
+            name: "Sniper".to_string(),
+            slot: 6,
+            kind: WeaponKind::SniperRifle,
+            damage: 125.0,
+            range: 160.0,
+            fire_interval: 1.0,
+            clip_size: 1,
+            reload_time: 1.4,
+            is_explosive: false,
+        },
+        35 | 36 => WeaponSpec {
+            id: weapon_id as u32,
+            name: "RPG".to_string(),
+            slot: 7,
+            kind: WeaponKind::Heavy,
+            damage: 200.0,
+            range: 120.0,
+            fire_interval: 1.2,
+            clip_size: 1,
+            reload_time: 1.8,
+            is_explosive: true,
+        },
+        _ => return None,
+    };
+    Some(spec)
+}
+
 fn decode_txd_with_masks(bytes: &[u8]) -> Vec<(String, u32, u32, Vec<u8>, bool)> {
     let Ok(archive) = TxdArchive::parse(bytes) else {
         return Vec::new();
@@ -3053,5 +3844,154 @@ mod tests {
             sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
         }
         assert!(sim.ui_state.screen_fade_alpha > 0.8);
+    }
+
+    #[test]
+    fn pay_n_spray_garage_repairs_recolors_and_clears_wanted() {
+        use gtasarust_gta_formats::ipl::IplGarage;
+
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        sim.world.garages.push(IplGarage {
+            pos1: [2060.0, -1835.0, 12.0],
+            front_x: 2070.0,
+            front_y: -1835.0,
+            pos2: [2060.0, -1825.0, 18.0],
+            flags: 0,
+            garage_type: 5,
+            name: "sprLAe".to_string(),
+        });
+
+        let vid = sim.vehicles.vehicles[0].id;
+        let orig_color = sim.vehicles.get(vid).unwrap().color1;
+        sim.player.control_mode = ControlMode::InVehicle;
+        sim.player.current_vehicle = Some(vid);
+        sim.player.position = Vec3::new(2065.0, -1830.0, 13.5);
+        sim.player.money = 250;
+        sim.player.wanted_stars = 3;
+        sim.ai.wanted_stars = 3;
+        if let Some(v) = sim.vehicles.get_mut(vid) {
+            v.position = Vec3::new(2065.0, -1830.0, 13.5);
+            v.health = 420.0;
+        }
+
+        sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+
+        assert_eq!(sim.player.money, 150);
+        assert_eq!(sim.player.wanted_stars, 0);
+        assert_eq!(sim.ai.wanted_stars, 0);
+        let veh = sim.vehicles.get(vid).unwrap();
+        assert!((veh.health - 1000.0).abs() < 1e-3);
+        assert_ne!(veh.color1, orig_color);
+    }
+
+    #[test]
+    fn cutscene_playback_subtitles_skip_and_scripted_camera_work() {
+        use gtasarust_gta_formats::cut::CutsceneSubtitle;
+
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::ToggleWidescreen(true));
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::SetPlayerControl {
+                player_idx: 0,
+                enabled: false,
+            });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::SetFixedCameraPosition {
+                pos: [100.0, 200.0, 30.0],
+                rot_offset: [0.0; 3],
+            });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::PointCameraAtPoint {
+                pos: [110.0, 210.0, 15.0],
+                switch_style: 2,
+            });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::LoadCutscene("TESTCUT".to_string()));
+        sim.scm.world_commands.push(ScmWorldCommand::StartCutscene);
+        sim.drain_scm_world_commands();
+
+        sim.active_cutscene = Some(CutsceneFile {
+            subtitles: vec![CutsceneSubtitle {
+                start_ms: 100,
+                duration_ms: 2000,
+                gxt_key: "MENU_NEW".to_string(),
+            }],
+            ..Default::default()
+        });
+        sim.cutscene_end_ms = 5000.0;
+
+        assert!(sim.ui_state.widescreen);
+        assert!(!sim.player_control_enabled);
+        assert!(sim.scripted_camera_override);
+
+        for _ in 0..15 {
+            sim.step_fixed_tick(1.0 / 60.0, &ActionFrameState::default());
+        }
+        assert!(sim.cutscene_playing);
+        assert!(sim.ui_state.cutscene_subtitle.is_some());
+        assert!((sim.camera.position.x - 100.0).abs() < 1e-3);
+        assert!((sim.camera.target.x - 110.0).abs() < 1e-3);
+
+        // Press skip -> completes & sets cutscene_skipped
+        sim.step_fixed_tick(
+            1.0 / 60.0,
+            &ActionFrameState {
+                skip_cutscene_just_pressed: true,
+                ..Default::default()
+            },
+        );
+        assert!(!sim.cutscene_playing);
+        assert!(sim.scm.world_snapshot.cutscene_skipped);
+        assert!(sim.scm.world_snapshot.cutscene_finished);
+
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::RestoreCamera { jumpcut: true });
+        sim.scm
+            .world_commands
+            .push(ScmWorldCommand::ToggleWidescreen(false));
+        sim.drain_scm_world_commands();
+        assert!(!sim.scripted_camera_override);
+        assert!(!sim.ui_state.widescreen);
+    }
+
+    #[test]
+    fn helicopter_flight_spins_rotors_and_tilts_chassis() {
+        let mut sim = GameWorldState::initialize(EngineConfig::default(), HostInfo::detect(), true);
+        let heli_id = sim.vehicles.spawn(VehicleSpawnSpec {
+            model_id: 487,
+            name: "MAVERICK",
+            class: VehicleClass::Helicopter,
+            position: Vec3::new(2000.0, -2400.0, 20.0),
+            yaw: 0.0,
+            color1: [0.2, 0.4, 0.8],
+            handling: None,
+        });
+        sim.player.control_mode = ControlMode::InVehicle;
+        sim.player.current_vehicle = Some(heli_id);
+        if let Some(h) = sim.vehicles.get_mut(heli_id) {
+            h.occupied_by_player = true;
+        }
+
+        let fly = ActionFrameState {
+            move_axis: glam::Vec2::new(0.5, 1.0),
+            ..Default::default()
+        };
+        sim.step_fixed_tick(1.0 / 60.0, &fly);
+        let spin_after_1 = sim.vehicles.get(heli_id).unwrap().rotor_spin;
+        for _ in 0..29 {
+            sim.step_fixed_tick(1.0 / 60.0, &fly);
+        }
+        let heli = sim.vehicles.get(heli_id).unwrap();
+        assert!(spin_after_1 > 0.2);
+        assert!((heli.rotor_spin - spin_after_1).abs() > 0.1);
+        assert!(heli.pitch.abs() > 0.05);
+        assert!(heli.roll.abs() > 0.05);
     }
 }

@@ -27,6 +27,7 @@ pub struct ActionFrameState {
     pub aim_or_reverse: bool,
     pub enter_exit_vehicle: bool,
     pub enter_exit_just_pressed: bool,
+    pub skip_cutscene_just_pressed: bool,
     pub next_weapon: bool,
     pub prev_weapon: bool,
     pub radio_next: bool,
@@ -178,6 +179,8 @@ impl InputManager {
             aim_or_reverse: self.pressed_mouse.contains(&MouseButton::Right),
             enter_exit_vehicle: self.is_down(KeyCode::KeyF) || self.is_down(KeyCode::Enter),
             enter_exit_just_pressed: self.was_just_pressed(KeyCode::KeyF)
+                || self.was_just_pressed(KeyCode::Enter),
+            skip_cutscene_just_pressed: self.was_just_pressed(KeyCode::Space)
                 || self.was_just_pressed(KeyCode::Enter),
             next_weapon: self.was_just_pressed(KeyCode::KeyE),
             prev_weapon: self.was_just_pressed(KeyCode::KeyQ),

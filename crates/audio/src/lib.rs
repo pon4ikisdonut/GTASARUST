@@ -33,6 +33,8 @@ pub enum SfxCue {
     Crash,
     Explosion,
     RadioClick,
+    Respray,
+    Siren,
 }
 
 struct DecodedRadioTrack {
@@ -69,6 +71,10 @@ pub struct AudioEngine {
     shot_cooldown: f32,
     horn_cooldown: f32,
     crash_cooldown: f32,
+    siren_cooldown: f32,
+    respray_cooldown: f32,
+    engine_handle: Option<StaticSoundHandle>,
+    engine_loop_clip: StaticSoundData,
     sa_sfx_loaded: usize,
 }
 
@@ -152,6 +158,8 @@ impl AudioEngine {
             SfxCue::Crash,
             SfxCue::Explosion,
             SfxCue::RadioClick,
+            SfxCue::Respray,
+            SfxCue::Siren,
         ] {
             sfx_clips.insert(cue, synthesize_fallback_sfx(cue));
         }
@@ -183,6 +191,10 @@ impl AudioEngine {
             shot_cooldown: 0.0,
             horn_cooldown: 0.0,
             crash_cooldown: 0.0,
+            siren_cooldown: 0.0,
+            respray_cooldown: 0.0,
+            engine_handle: None,
+            engine_loop_clip: synthesize_engine_loop(),
             sa_sfx_loaded: 0,
         }
     }
@@ -347,6 +359,8 @@ impl AudioEngine {
         self.shot_cooldown = (self.shot_cooldown - dt).max(0.0);
         self.horn_cooldown = (self.horn_cooldown - dt).max(0.0);
         self.crash_cooldown = (self.crash_cooldown - dt).max(0.0);
+        self.siren_cooldown = (self.siren_cooldown - dt).max(0.0);
+        self.respray_cooldown = (self.respray_cooldown - dt).max(0.0);
 
         while let Ok(decoded) = self.radio_rx.try_recv() {
             if decoded.generation != self.decode_generation {
@@ -423,6 +437,18 @@ impl AudioEngine {
                 self.crash_cooldown = 0.45;
             }
             SfxCue::Explosion | SfxCue::RadioClick => {}
+            SfxCue::Respray => {
+                if self.respray_cooldown > 0.0 {
+                    return;
+                }
+                self.respray_cooldown = 1.2;
+            }
+            SfxCue::Siren => {
+                if self.siren_cooldown > 0.0 {
+                    return;
+                }
+                self.siren_cooldown = 0.62;
+            }
         }
 
         let clip = if cue == SfxCue::Footstep && !self.footstep_variants.is_empty() {
@@ -504,9 +530,55 @@ impl AudioEngine {
         let scale = match cue {
             SfxCue::Footstep => 0.35,
             SfxCue::RadioClick => 0.30,
+            SfxCue::Siren => 0.42,
             _ => 0.70,
         };
         linear_to_decibels(self.master_volume * self.sfx_volume * scale)
+    }
+
+    /// Updates continuous vehicle engine RPM pitch/volume and active emergency siren playback.
+    pub fn update_vehicle_audio(
+        &mut self,
+        in_vehicle: bool,
+        speed_mps: f32,
+        is_bicycle: bool,
+        siren_on: bool,
+        _dt: f32,
+    ) {
+        if siren_on && self.siren_cooldown <= 0.0 {
+            self.play_sfx(SfxCue::Siren);
+        }
+
+        let Some(manager) = self.manager.as_mut() else {
+            self.engine_handle = None;
+            return;
+        };
+
+        if !in_vehicle || is_bicycle {
+            if let Some(mut handle) = self.engine_handle.take() {
+                handle.stop(kira::Tween::default());
+            }
+            return;
+        }
+
+        let speed_ratio = (speed_mps.abs() / 42.0).clamp(0.0, 1.0);
+        let pitch = 0.75 + speed_ratio * 1.45;
+        let engine_db =
+            linear_to_decibels(self.master_volume * self.sfx_volume * (0.14 + speed_ratio * 0.18));
+
+        if self.engine_handle.is_none() {
+            let clip = self
+                .engine_loop_clip
+                .clone()
+                .volume(engine_db)
+                .playback_rate(f64::from(pitch));
+            if let Ok(handle) = manager.play(clip) {
+                self.engine_handle = Some(handle);
+            }
+        } else if let Some(handle) = self.engine_handle.as_mut() {
+            handle.set_volume(engine_db, kira::Tween::default());
+            handle.set_playback_rate(f64::from(pitch), kira::Tween::default());
+        }
     }
 }
 
@@ -545,6 +617,8 @@ fn synthesize_fallback_sfx(cue: SfxCue) -> StaticSoundData {
         SfxCue::Crash => 0.18,
         SfxCue::Explosion => 0.48,
         SfxCue::RadioClick => 0.03,
+        SfxCue::Respray => 0.85,
+        SfxCue::Siren => 0.60,
     };
     let count = (sample_rate as f32 * duration_secs) as usize;
     let mut frames = Vec::with_capacity(count);
@@ -575,6 +649,16 @@ fn synthesize_fallback_sfx(cue: SfxCue) -> StaticSoundData {
                 (noise * 0.9 + (t * 48.0 * std::f32::consts::TAU).sin() * 0.65) * env
             }
             SfxCue::RadioClick => (t * 1400.0 * std::f32::consts::TAU).sin() * 0.25 * env,
+            SfxCue::Respray => {
+                let hiss = (((i as f32) * 19.73).sin() * 43_758.547).fract() * 2.0 - 1.0;
+                let pulse = (t * 16.0 * std::f32::consts::TAU).sin().abs() * 0.35 + 0.65;
+                let attack = (t / 0.06).min(1.0);
+                hiss * 0.32 * pulse * attack * env
+            }
+            SfxCue::Siren => {
+                let sweep = 660.0 + ((t / duration_secs) * std::f32::consts::PI).sin() * 440.0;
+                (t * sweep * std::f32::consts::TAU).sin() * 0.34 * env.sqrt()
+            }
         };
         frames.push(Frame::from_mono(sample.clamp(-0.95, 0.95)));
     }
@@ -582,6 +666,27 @@ fn synthesize_fallback_sfx(cue: SfxCue) -> StaticSoundData {
         sample_rate,
         frames: Arc::from(frames),
         settings: StaticSoundSettings::new(),
+        slice: None,
+    }
+}
+
+fn synthesize_engine_loop() -> StaticSoundData {
+    let sample_rate = 22050u32;
+    let duration_secs = 0.25_f32;
+    let total = (sample_rate as f32 * duration_secs) as usize;
+    let mut frames = Vec::with_capacity(total);
+    for i in 0..total {
+        let t = i as f32 / sample_rate as f32;
+        let fundamental = (t * 56.0 * std::f32::consts::TAU).sin();
+        let harmonic2 = (t * 112.0 * std::f32::consts::TAU).sin() * 0.5;
+        let harmonic3 = (t * 168.0 * std::f32::consts::TAU).sin() * 0.25;
+        let sample = (fundamental + harmonic2 + harmonic3) * 0.22;
+        frames.push(Frame::from_mono(sample.clamp(-0.95, 0.95)));
+    }
+    StaticSoundData {
+        sample_rate,
+        frames: Arc::from(frames),
+        settings: StaticSoundSettings::new().loop_region(0.0..),
         slice: None,
     }
 }
@@ -618,6 +723,10 @@ mod tests {
         audio.set_in_vehicle(true);
         audio.play_sfx(SfxCue::PistolShot);
         audio.play_sfx(SfxCue::Footstep);
+        audio.play_sfx(SfxCue::Respray);
+        audio.play_sfx(SfxCue::Siren);
+        audio.update_vehicle_audio(true, 18.0, false, true, 0.016);
+        audio.update_vehicle_audio(false, 0.0, false, false, 0.016);
         audio.update(0.016);
         audio.set_in_vehicle(false);
     }

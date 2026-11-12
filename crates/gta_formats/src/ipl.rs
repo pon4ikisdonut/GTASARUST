@@ -53,6 +53,18 @@ pub struct IplOcclusionBox {
     pub rotation: [f32; 3],
 }
 
+/// Garage zone definition from IPL `grge` sections (Pay 'n' Spray, Mod Garages, Safehouses).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IplGarage {
+    pub pos1: [f32; 3],
+    pub front_x: f32,
+    pub front_y: f32,
+    pub pos2: [f32; 3],
+    pub flags: u32,
+    pub garage_type: u32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IplFile {
     pub instances: Vec<IplInstance>,
@@ -60,6 +72,7 @@ pub struct IplFile {
     pub entry_exits: Vec<IplEntryExit>,
     pub zones: Vec<IplZoneBox>,
     pub occluders: Vec<IplOcclusionBox>,
+    pub garages: Vec<IplGarage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +83,7 @@ enum IplSection {
     Enex,
     Zone,
     Occl,
+    Grge,
     Other,
 }
 
@@ -186,6 +200,7 @@ impl IplFile {
                     "enex" => IplSection::Enex,
                     "zone" => IplSection::Zone,
                     "occl" => IplSection::Occl,
+                    "grge" => IplSection::Grge,
                     _ => IplSection::Other,
                 };
                 continue;
@@ -291,6 +306,25 @@ impl IplFile {
                         ],
                     });
                 }
+                IplSection::Grge if fields.len() >= 11 => {
+                    out.garages.push(IplGarage {
+                        pos1: [
+                            fields[0].parse().unwrap_or(0.0),
+                            fields[1].parse().unwrap_or(0.0),
+                            fields[2].parse().unwrap_or(0.0),
+                        ],
+                        front_x: fields[3].parse().unwrap_or(0.0),
+                        front_y: fields[4].parse().unwrap_or(0.0),
+                        pos2: [
+                            fields[5].parse().unwrap_or(0.0),
+                            fields[6].parse().unwrap_or(0.0),
+                            fields[7].parse().unwrap_or(0.0),
+                        ],
+                        flags: fields[8].parse().unwrap_or(0),
+                        garage_type: fields[9].parse().unwrap_or(0),
+                        name: fields[10].trim_matches('"').to_string(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -305,10 +339,13 @@ mod tests {
 
     #[test]
     fn parses_text_and_binary_ipl() {
-        let text = "inst\n3563, LODpmedhos2_LAe, 0, 2063.1, -1731.7, 15.2, 0, 0, 0.707, 0.707, -1\nend\nenex\n2495.33, -1690.75, 13.7847, 0, 1.4, 1.4, 8, 2495.33, -1690.25, 13.7847, 0, 0, 4, \"CARLS\", 0, 2, 0, 24\nend\n";
+        let text = "inst\n3563, LODpmedhos2_LAe, 0, 2063.1, -1731.7, 15.2, 0, 0, 0.707, 0.707, -1\nend\ngrge\n2056.6, -1835.9, 12.5443, 2071.3, -1835.9, 2056.6, -1826.97, 18.5443, 1, 5, sprLAe\nend\nenex\n2495.33, -1690.75, 13.7847, 0, 1.4, 1.4, 8, 2495.33, -1690.25, 13.7847, 0, 0, 4, \"CARLS\", 0, 2, 0, 24\nend\n";
         let parsed = IplFile::parse_text(text);
         assert_eq!(parsed.instances.len(), 1);
         assert_eq!(parsed.instances[0].id, 3563);
+        assert_eq!(parsed.garages.len(), 1);
+        assert_eq!(parsed.garages[0].name, "sprLAe");
+        assert_eq!(parsed.garages[0].garage_type, 5);
         assert_eq!(parsed.entry_exits.len(), 1);
         assert_eq!(parsed.entry_exits[0].name, "CARLS");
         assert_eq!(parsed.entry_exits[0].target_interior, 0);

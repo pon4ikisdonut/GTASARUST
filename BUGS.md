@@ -6,12 +6,13 @@ This file tracks active defects, regressions, and platform issues discovered dur
 
 | ID | Severity | Subsystem | Summary | Status |
 | --- | --- | --- | --- | --- |
-| — | — | — | No open blockers in Milestone G1 baseline (verified 54/54 workspace tests across Windows & WSL2 Linux + Vulkan RX 480 launch; remaining parity work is `main.scm` + `script.img` story mission/cutscene scripting, bikes/aircraft, shops/garages & ped/engine audio streams). | Clear |
+| — | — | — | No open blockers in Milestone G2 baseline (verified `62/62` workspace tests across Windows & WSL2 Linux + Vulkan RX 480 launch; remaining parity work is full mid/late Los Santos mission chains, planes/trains/Mod Garages & radio DJ/ped speech audio banks). | Clear |
 
 ## Resolved Issues
 
 | ID | Severity | Subsystem | Summary | Resolution |
 | --- | --- | --- | --- | --- |
+| BUG-015 | High | `scripting` / `gta_formats` | Retail `main.scm` mission threads overflowed `128`-element `locals` (`LocalVar(178)`), lacked `TIMERA`/`TIMERB` (`locals[32..=33]`), mis-mapped `0x0826` (`DISPLAY_HUD`), lacked `0x0871`/`0x0872` `SWITCH_START`/`SWITCH_CONTINUED`, and did not load `script.img` streamed scripts or negative relative jumps across `GOSUB`/`RETURN`. | Expanded mission `locals` to `1024` w/ `TIMERA`/`TIMERB` frame increments, fixed `0x0826` `DISPLAY_HUD` & cast/cutscene opcodes, implemented `SwitchTable`/`PendingSwitch` `defaultLabel` routing, and added `ScmCodeSource::{Main, Streamed}` + `script.img` loading (`79` scripts; `22` retail threads stay alive past `1,400` ticks). |
 | BUG-014 | Medium | `localization` / `ui` / `game` | Raw `~r~`/`~w~` GXT color tags showed unformatted in text boxes and `DoFade`/`DisplayHud`/`DisplayRadar` SCM commands did not control the screen curtain or HUD visibility. | Added `CHudColours` `parse_sa_rich_text` (`~r~/~g~/~b~/~y~/~p~/~w~/~s~/~l~/~h~/~n~`) rendered via `egui::text::LayoutJob` and wired `DoFade`/`DisplayHud`/`DisplayRadar` to `sa_screen_fade` curtain & UI overrides. |
 | BUG-013 | High | `physics` / `vehicles` / `renderer` / `game` | Vehicles had no dynamic `rapier3d` colliders (bullets passed through cars, self-raycasts could hit own geometry), water had no swimming/buoyancy, weapons lacked OTS aim/hand attachment, and `shad_*` cards rendered opaque. | Synced per-vehicle kinematic box colliders (`VEHICLE_COLLIDER_TAG_FLAG`) w/ `raycast_excluding`, added `water_height_at` buoyancy & `< 250 HP` explosion chain reactions, OTS aim camera + `siteM16` + `BONE_R_HAND` weapon DFFs, and `convert_shadow_luminance_to_alpha` soft terrain shadows. |
 | BUG-012 | High | `renderer` / `vehicles` | SA `.dff` vehicles only attach a single `wheel` atomic to `wheel_rf_dummy`, leaving 3 wheels missing and flat wheel spin/roll. | Implemented `CpuMeshData::dff_vehicle_parts` + `CachedVehicleModel` mounting rotated/steered/spun wheels onto all `wheel_*_dummy` frames (`wheel_lf_dummy` flipped `PI`) with 4-point `.col` pitch/roll alignment. |
