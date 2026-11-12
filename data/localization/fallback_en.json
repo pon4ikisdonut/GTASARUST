@@ -1,0 +1,10 @@
+{
+  "FE_HLP1": "Welcome to GTASARUST. Point --game-dir to your authorized GTA: San Andreas installation to load original world data.",
+  "HUD_WANT": "WANTED",
+  "HUD_CASH": "$",
+  "MENU_NEW": "START GAME",
+  "MENU_LOAD": "LOAD GAME",
+  "MENU_SAVE": "SAVE GAME",
+  "MENU_OPTS": "OPTIONS",
+  "MENU_QUIT": "QUIT GAME"
+}

@@ -1,0 +1,15 @@
+[package]
+name = "gtasarust-asset-extractor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gtasarust-asset-pipeline.workspace = true
+gtasarust-engine.workspace = true
+gtasarust-gta-formats.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

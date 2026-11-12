@@ -1,0 +1,21 @@
+[package]
+name = "gtasarust-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+glam.workspace = true
+gtasarust-engine.workspace = true
+gtasarust-gta-formats.workspace = true
+gtasarust-world.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+winit.workspace = true

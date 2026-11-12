@@ -1,0 +1,11 @@
+[package]
+name = "gtasarust-physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+rapier3d.workspace = true
+tracing.workspace = true

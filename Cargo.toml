@@ -1,0 +1,100 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/engine",
+    "crates/gta_formats",
+    "crates/asset_pipeline",
+    "crates/renderer",
+    "crates/physics",
+    "crates/audio",
+    "crates/input",
+    "crates/world",
+    "crates/entities",
+    "crates/vehicles",
+    "crates/weapons",
+    "crates/ai",
+    "crates/animation",
+    "crates/scripting",
+    "crates/missions",
+    "crates/localization",
+    "crates/ui",
+    "crates/save_system",
+    "crates/game",
+    "crates/tools",
+    "tools/asset_extractor",
+    "tools/asset_converter",
+    "tools/map_inspector",
+    "tools/model_viewer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/pon4ikisdonut/GTASARUST"
+homepage = "https://github.com/pon4ikisdonut/GTASARUST"
+authors = ["GTASARUST Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crc32fast = "1.5.5"
+directories = "6.0.0"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = "0.37.0"
+egui-winit = "0.37.0"
+gilrs = "0.11.2"
+glam = { version = "0.34.3", features = ["serde", "bytemuck"] }
+gltf = "1.4.1"
+image = "0.25.10"
+kira = "0.12.6"
+parking_lot = "0.13.0"
+rapier3d = "0.36.1"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "fs", "sync", "time", "macros"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+walkdir = "2.5.0"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+# Internal workspace crates
+gtasarust-ai = { path = "crates/ai" }
+gtasarust-animation = { path = "crates/animation" }
+gtasarust-asset-pipeline = { path = "crates/asset_pipeline" }
+gtasarust-audio = { path = "crates/audio" }
+gtasarust-engine = { path = "crates/engine" }
+gtasarust-entities = { path = "crates/entities" }
+gtasarust-gta-formats = { path = "crates/gta_formats" }
+gtasarust-input = { path = "crates/input" }
+gtasarust-localization = { path = "crates/localization" }
+gtasarust-missions = { path = "crates/missions" }
+gtasarust-physics = { path = "crates/physics" }
+gtasarust-renderer = { path = "crates/renderer" }
+gtasarust-save-system = { path = "crates/save_system" }
+gtasarust-scripting = { path = "crates/scripting" }
+gtasarust-tools = { path = "crates/tools" }
+gtasarust-ui = { path = "crates/ui" }
+gtasarust-vehicles = { path = "crates/vehicles" }
+gtasarust-weapons = { path = "crates/weapons" }
+gtasarust-world = { path = "crates/world" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

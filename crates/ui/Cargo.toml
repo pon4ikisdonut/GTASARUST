@@ -1,0 +1,17 @@
+[package]
+name = "gtasarust-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+egui.workspace = true
+glam.workspace = true
+gtasarust-engine.workspace = true
+gtasarust-entities.workspace = true
+gtasarust-localization.workspace = true
+gtasarust-missions.workspace = true
+gtasarust-save-system.workspace = true
+gtasarust-vehicles.workspace = true
+gtasarust-world.workspace = true

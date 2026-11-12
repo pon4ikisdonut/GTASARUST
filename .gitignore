@@ -1,0 +1,59 @@
+# Rust / Cargo build outputs
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+
+# IDE / OS temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration & environment overrides
+.env
+.env.*
+*.local.toml
+gtasarust.local.toml
+
+# Logs and runtime data
+logs/
+*.log
+saves/
+screenshots/
+
+# External / copyrighted GTA: San Andreas original and converted assets
+# NEVER commit original Rockstar Games files or extracted game data.
+assets/original/
+assets/extracted/
+assets/converted/
+assets/cache/
+assets/runtime/
+*.img
+*.IMG
+*.dff
+*.DFF
+*.txd
+*.TXD
+*.col
+*.COL
+*.ifp
+*.IFP
+*.scm
+*.SCM
+*.gxt
+*.GXT
+*.iso
+*.ISO
+*.bin
+*.BIN
+*.mpg
+*.MPG
+*.fxp
+*.FXP
+*.exe
+*.dll

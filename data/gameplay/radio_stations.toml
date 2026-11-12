@@ -1,0 +1,72 @@
+# San Andreas Radio Stations Metadata (Engine Registry)
+[[station]]
+id = 0
+code = "RADIO_OFF"
+name = "Radio Off"
+stream_file = ""
+
+[[station]]
+id = 1
+code = "PLAYBACK"
+name = "Playback FM"
+stream_file = "PF"
+
+[[station]]
+id = 2
+code = "KROSE"
+name = "K-Rose"
+stream_file = "CR"
+
+[[station]]
+id = 3
+code = "KDST"
+name = "K-DST"
+stream_file = "DS"
+
+[[station]]
+id = 4
+code = "BOUNCE"
+name = "Bounce FM"
+stream_file = "HC"
+
+[[station]]
+id = 5
+code = "SFUR"
+name = "SF-UR"
+stream_file = "SF"
+
+[[station]]
+id = 6
+code = "RLS"
+name = "Radio Los Santos"
+stream_file = "RL"
+
+[[station]]
+id = 7
+code = "RADIOX"
+name = "Radio X"
+stream_file = "RE"
+
+[[station]]
+id = 8
+code = "CSR"
+name = "CSR 103.9"
+stream_file = "NJ"
+
+[[station]]
+id = 9
+code = "KJAH"
+name = "K-Jah West"
+stream_file = "RG"
+
+[[station]]
+id = 10
+code = "MASTERSOUNDS"
+name = "Master Sounds 98.3"
+stream_file = "MH"
+
+[[station]]
+id = 11
+code = "WCTR"
+name = "WCTR"
+stream_file = "TK"

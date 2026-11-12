@@ -1,0 +1,14 @@
+[package]
+name = "gtasarust-vehicles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+gtasarust-entities.workspace = true
+gtasarust-gta-formats.workspace = true
+gtasarust-input.workspace = true
+gtasarust-physics.workspace = true
+serde.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "gtasarust-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gilrs.workspace = true
+glam.workspace = true
+serde.workspace = true
+tracing.workspace = true
+winit.workspace = true

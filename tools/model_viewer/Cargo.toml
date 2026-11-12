@@ -1,0 +1,13 @@
+[package]
+name = "gtasarust-model-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gtasarust-engine.workspace = true
+gtasarust-gta-formats.workspace = true
+serde_json.workspace = true

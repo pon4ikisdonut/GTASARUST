@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  linux-x86_64:
+    name: Linux x86_64 (build, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libasound2-dev \
+            libudev-dev \
+            libdbus-1-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (Linux x86_64)
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+      - name: Test (Linux x86_64)
+        run: cargo test --workspace --target x86_64-unknown-linux-gnu
+      - name: Release Build (Linux x86_64)
+        run: cargo build --release --workspace --target x86_64-unknown-linux-gnu
+      - name: Smoke Test Headless Game Launch (Linux x86_64)
+        run: ./target/x86_64-unknown-linux-gnu/release/gtasarust --headless --smoke-test
+
+  windows-x86_64:
+    name: Windows x86_64 (build, clippy, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (Windows x86_64)
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Test (Windows x86_64)
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+      - name: Release Build (Windows x86_64)
+        run: cargo build --release --workspace --target x86_64-pc-windows-msvc
+      - name: Smoke Test Headless Game Launch (Windows x86_64)
+        run: .\target\x86_64-pc-windows-msvc\release\gtasarust.exe --headless --smoke-test
+
+  dependency-check:
+    name: Dependency & License Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo verify-project
+      - run: cargo tree --workspace --duplicates || true
+      - name: Check for prohibited copyrighted files
+        run: |
+          if find . -maxdepth 4 -iname "*.img" -o -iname "*.dff" -o -iname "*.txd" -o -iname "*.scm" -o -iname "*.gxt" -o -iname "*.iso" | grep -q .; then
+            echo "Error: Original game assets must not be committed!"
+            exit 1
+          fi

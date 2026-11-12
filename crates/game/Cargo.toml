@@ -1,0 +1,50 @@
+[package]
+name = "gtasarust-game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gtasarust"
+path = "src/main.rs"
+
+[[test]]
+name = "integration_suite"
+path = "../../tests/integration/engine_integration.rs"
+
+[[test]]
+name = "gameplay_suite"
+path = "../../tests/gameplay/gameplay_integration.rs"
+
+[[test]]
+name = "assets_suite"
+path = "../../tests/assets/asset_pipeline_tests.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+egui.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+gtasarust-ai.workspace = true
+gtasarust-animation.workspace = true
+gtasarust-asset-pipeline.workspace = true
+gtasarust-audio.workspace = true
+gtasarust-engine.workspace = true
+gtasarust-entities.workspace = true
+gtasarust-gta-formats.workspace = true
+gtasarust-input.workspace = true
+gtasarust-localization.workspace = true
+gtasarust-missions.workspace = true
+gtasarust-physics.workspace = true
+gtasarust-renderer.workspace = true
+gtasarust-save-system.workspace = true
+gtasarust-scripting.workspace = true
+gtasarust-ui.workspace = true
+gtasarust-vehicles.workspace = true
+gtasarust-weapons.workspace = true
+gtasarust-world.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+winit.workspace = true

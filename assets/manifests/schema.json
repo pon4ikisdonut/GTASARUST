@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GTASARUST Asset Manifest",
+  "type": "object",
+  "required": ["schema_version", "game_version", "archives", "models", "textures", "collisions", "warnings"],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "game_version": { "type": "string" },
+    "archives": { "type": "array" },
+    "models": { "type": "integer" },
+    "textures": { "type": "integer" },
+    "collisions": { "type": "integer" },
+    "warnings": { "type": "array" }
+  }
+}
