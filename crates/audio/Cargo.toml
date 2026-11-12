@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 gtasarust-engine.workspace = true
+gtasarust-gta-formats.workspace = true
 kira.workspace = true
 serde.workspace = true
 tracing.workspace = true

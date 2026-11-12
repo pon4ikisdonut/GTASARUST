@@ -24,5 +24,5 @@ Tracks feature parity between the original *Grand Theft Auto: San Andreas* (PC v
 | **AI & Law** | Pedestrian AI, traffic AI, 6-star police & wanted system | In progress (`NODES*.DAT` traffic driving/yielding & sidewalk peds, carjacking crime/panic, police pursuit) | `gtasarust-ai` |
 | **Gameplay** | Health, armor, money, stamina, respect, weapons, shops, garages | In progress (health/armor, Colt .45 inventory/firing, wanted loop) | `gtasarust-entities`, `gtasarust-weapons` |
 | **Story** | Complete campaign missions, cutscenes, side activities | In progress (checkpoint campaign framework) | `gtasarust-missions`, `gtasarust-scripting` |
-| **Audio** | SFX banks, vehicle engines, footsteps, radio stations, volume mixer | In progress (`kira` mixer initialized; Vorbis/SFX stream decoding pending) | `gtasarust-audio` |
+| **Audio** | SFX banks, vehicle engines, footsteps, radio stations, volume mixer | In progress (`audio/streams` XOR Ogg Vorbis radio streaming & `audio/SFX` PCM footsteps/gunshots/horn/crash active via `kira`; engine RPM pitch synthesis pending) | `gtasarust-audio`, `gtasarust-gta-formats` |
 | **UI & Saves** | Authentic SA HUD, radar, menus, 8 versioned save slots | In progress (`egui` menus/HUD + SHA-256 save slots tested) | `gtasarust-ui`, `gtasarust-save-system` |

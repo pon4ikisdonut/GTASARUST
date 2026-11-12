@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Real GTA:SA audio playback in `gtasarust-gta-formats` (`audio_cfg.rs`) and `gtasarust-audio` (`kira`): rotating 16-byte XOR Ogg Vorbis stream extraction (`StrmPaks.dat`/`TrakLkup.dat`, `offset + 8068`), uncompressed 16-bit PCM SFX bank reader (`PakFiles.dat`/`BankLkup.dat`, 4804-byte bank header), background radio decoding on `R`/vehicle entry (`264` tracks across `7` stations verified on `E:\gtasa`), `FEET`/`GENRL` footsteps, weapon shots, car horn, crash SFX, and procedural fallback SFX when running without `--game-dir`.
+- `AGENTS.md` and `CONTINUE.md` autonomous resumption and verification handoff guides.
 - `NODES*.DAT` road & pedestrian navigation graph parser (`crates/gta_formats/src/paths.rs`, verified across all 64 sectors: `68,237` nodes and `143,622` links) plus `PathGraph` spatial routing (`gtasarust-world`), sidewalk-patrolling pedestrians, ambient road traffic following vehicle physics/handling & yielding to obstacles, and carjacking crime/panic reactions (`gtasarust-ai`, `gtasarust-game`).
 - Dynamic `.col` collision streaming (`10,160` models indexed from `models/coll/*.col`, `gta3.img`, `gta_int.img`), transformed `rapier3d` trimesh/box/sphere static colliders (`25,041` active around Grove Street), on-foot wall sliding, vehicle wall impact damage, and ground-raycast spawning on real Grove Street asphalt (`Z=12.712m`, `BUG-006`).
 - Ambient parked vehicle spawning from binary IPL `CARS` sections (`1,043` entries across San Andreas) in `gtasarust-game`, plus `Car Spawns` reporting in `gtasarust-map-inspector` and binary IPL counting in `gtasarust-asset-pipeline`.

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use glam::{Quat, Vec3};
 use gtasarust_ai::{AiSimulation, CrimeEvent, PedBehavior};
-use gtasarust_audio::AudioEngine;
+use gtasarust_audio::{AudioEngine, SfxCue};
 use gtasarust_engine::{EngineConfig, FixedTimestep, GameClock, GameDataRoot, HostInfo};
 use gtasarust_entities::{PlayerEntity, PlayerLifeState};
 use gtasarust_gta_formats::{
@@ -21,7 +21,7 @@ use gtasarust_save_system::{SaveGameData, SavedWeaponSlot, read_save_slot, write
 use gtasarust_scripting::ScmVm;
 use gtasarust_ui::{GameUiState, ScreenState, UiActionQueue};
 use gtasarust_vehicles::{VehicleClass, VehicleManager, VehicleSpawnSpec};
-use gtasarust_weapons::WeaponInventory;
+use gtasarust_weapons::{WeaponInventory, WeaponKind};
 use gtasarust_world::{SectorCoord, WorldManager};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
@@ -117,7 +117,10 @@ impl GameWorldState {
 
         let physics = PhysicsWorld::new();
         let input = InputManager::new(config.controls.gamepad_deadzone);
-        let audio = AudioEngine::new(&config.audio, headless);
+        let mut audio = AudioEngine::new(&config.audio, headless);
+        if let Some(vfs) = &opened_vfs {
+            audio.attach_game_dir(vfs.root_path());
+        }
 
         let mut player = PlayerEntity::default();
         player
@@ -714,14 +717,20 @@ impl GameWorldState {
     pub fn step_fixed_tick(&mut self, dt: f32, actions: &ActionFrameState) {
         self.clock.advance(dt);
         self.audio.apply_config(&self.config.audio);
+        self.audio.update(dt);
 
         if actions.enter_exit_just_pressed {
             let was_on_foot = self.player.control_mode == ControlMode::OnFoot;
-            if self.vehicles.toggle_player_entry(&mut self.player)
-                && was_on_foot
-                && let Some(vid) = self.player.current_vehicle
-            {
-                self.ai.on_vehicle_entered(vid, &mut self.player);
+            if self.vehicles.toggle_player_entry(&mut self.player) {
+                if was_on_foot && let Some(vid) = self.player.current_vehicle {
+                    self.ai.on_vehicle_entered(vid, &mut self.player);
+                    self.audio.set_in_vehicle(true);
+                    if self.config.audio.radio_auto_tune && self.audio.current_station_idx == 0 {
+                        self.audio.cycle_radio_next();
+                    }
+                } else {
+                    self.audio.set_in_vehicle(false);
+                }
             }
         }
 
@@ -734,6 +743,17 @@ impl GameWorldState {
             && actions.fire_or_attack
             && let Some((damage, range, _explosive)) = self.player.weapons.try_fire()
         {
+            let shot_cue = match self.player.weapons.active().map(|w| w.spec.kind) {
+                Some(WeaponKind::Unarmed | WeaponKind::Melee) => SfxCue::Punch,
+                Some(
+                    WeaponKind::Shotgun
+                    | WeaponKind::AssaultRifle
+                    | WeaponKind::SniperRifle
+                    | WeaponKind::Heavy,
+                ) => SfxCue::HeavyShot,
+                _ => SfxCue::PistolShot,
+            };
+            self.audio.play_sfx(shot_cue);
             self.ai.alert_gunshot_near(self.player.position, 40.0);
             if self.player.weapons.active_slot >= 2 {
                 self.ai
@@ -753,8 +773,18 @@ impl GameWorldState {
         }
 
         self.player.update_on_foot(dt, actions, &self.physics);
+        if self.player.control_mode == ControlMode::OnFoot
+            && self.player.grounded
+            && self.player.velocity.truncate().length() > 1.2
+        {
+            self.audio.play_sfx(SfxCue::Footstep);
+        }
 
         let occupied_id = self.player.current_vehicle;
+        if occupied_id.is_some() && actions.crouch_or_horn {
+            self.audio.play_sfx(SfxCue::CarHorn);
+        }
+        let mut player_crash = false;
         for veh in &mut self.vehicles.vehicles {
             let ai_action = if Some(veh.id) == occupied_id {
                 None
@@ -771,11 +801,18 @@ impl GameWorldState {
             } else {
                 ai_action.as_ref()
             };
+            let prev_hp = veh.health;
             veh.step_physics(dt, input_for_veh, &self.physics);
             if Some(veh.id) == occupied_id {
+                if prev_hp - veh.health > 8.0 {
+                    player_crash = true;
+                }
                 self.player.position = veh.position;
                 self.player.yaw = veh.yaw;
             }
+        }
+        if player_crash {
+            self.audio.play_sfx(SfxCue::Crash);
         }
 
         self.physics.step(dt);
@@ -1128,12 +1165,17 @@ impl GameWorldState {
         let _ = std::fs::remove_file(written);
         anyhow::ensure!(loaded.money == save.money, "save roundtrip mismatch");
 
+        let decoded_radio_sample = self.audio.verify_first_radio_track_decodes();
+
         info!(
             ticks = self.timestep.total_ticks,
             player_pos = ?self.player.position,
             zone = %self.world.zone_name_at(self.player.position),
             vehicles = self.vehicles.vehicles.len(),
             handling_entries = self.handling.as_ref().map_or(0, |h| h.vehicles.len()),
+            audio_stations = self.audio.available_radio_count(),
+            audio_sfx_clips = self.audio.loaded_sfx_count(),
+            decoded_radio = ?decoded_radio_sample,
             "Smoke test checks passed"
         );
         Ok(())

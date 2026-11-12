@@ -1520,6 +1520,7 @@ name = "gtasarust-audio"
 version = "0.1.0"
 dependencies = [
  "gtasarust-engine",
+ "gtasarust-gta-formats",
  "kira",
  "serde",
  "tracing",
